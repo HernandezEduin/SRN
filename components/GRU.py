@@ -19,9 +19,9 @@ class GRU(layers.Layer):
         cell_1 = tf.keras.layers.GRUCell(d, dropout=dropout, recurrent_dropout=dropout) 
         cell_2 = tf.keras.layers.GRUCell(d, dropout=dropout, recurrent_dropout=dropout) 
         cell_3 = tf.keras.layers.GRUCell(d, dropout=dropout, recurrent_dropout=dropout) 
-        self.GRU = tf.keras.layers.RNN([cell_1, cell_2, cell_3])
+        self.GRU = tf.keras.layers.RNN([cell_1, cell_2, cell_3], return_state=True)
 
-    def call(self, r_t):
+    def call(self, r_t, states=None, training=False):
         # state_1, state_2, state_3 = self.states
         # output_1, state_1 = self.cell_1(r_t, state_1)
         # output_2, state_2 = self.cell_2(output_1, state_2)
@@ -30,7 +30,8 @@ class GRU(layers.Layer):
 
         r_t = tf.expand_dims(r_t, 0)
         r_t = tf.expand_dims(r_t, 0)
-        H_t_1 = self.GRU(r_t)
+        result = self.GRU(r_t, initial_state=states, training=training)
+        H_t_1 = result[0]
         H_t_1 = tf.reshape(H_t_1, [d])
 
-        return H_t_1
+        return H_t_1, tuple(result[1:])

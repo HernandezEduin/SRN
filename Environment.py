@@ -1,110 +1,79 @@
+"""Directed KG navigation and SRN's answer-only potential-based rewards."""
+
 import tensorflow as tf
 
 d = 50
 
-class State():
-    def __init__(self, q, e_s, e_t, h_t: set, t=1, q_t = {0: tf.zeros(d)}, H_t = {0: tf.zeros(d)}):
-        self.q = q
-        self.e_s = e_s
-        self.e_t = e_t
-        self.h_t = h_t
-        self.memory = {
-            't': t,
-            'q_t': q_t,
-            'H_t': H_t
-        }
+
+class State:
+    def __init__(self, q, e_s, e_t, h_t=None, t=1, q_t=None, H_t=None):
+        self.q, self.e_s, self.e_t = q, e_s, e_t
+        self.h_t = set() if h_t is None else h_t
+        self.memory = {"t": t, "q_t": {} if q_t is None else q_t,
+                       "H_t": {} if H_t is None else H_t}
 
     def set_memory(self, t, q_t, H_t):
-        self.memory['t'] = t
-        self.memory['q_t'] = q_t
-        self.memory['H_t'] = H_t
+        self.memory = {"t": t, "q_t": q_t, "H_t": H_t}
         return self
 
     def get_memory(self):
         return self.memory
 
 
-class Rewards():
-    def __init__(self, gamma = 0.95, rewards_dict = dict()):
+class Rewards:
+    def __init__(self, gamma=0.95):
         self.gamma = gamma
-        self.rewards_dict = rewards_dict
-
-    def get_transition_reward(self, cur_state, action, next_state, ans):
-        SAS = (cur_state, action, next_state)
-        if self.rewards_dict.get(SAS): return self.rewards_dict.get(SAS)    # Skip computation if reward has previously been computed
-        
-        F_phi = self.gamma * self.phi(next_state) - self.phi(cur_state)
-        R = 1 if next_state.e_t == ans else 0
-        reward = R + F_phi
-        self.rewards_dict[SAS] = reward     # Cache the (SAS -> R) mapping
-        return reward
 
     def phi(self, state):
-        state_memory = state.get_memory()
-        t = state_memory.get('t')
+        memory = state.get_memory()
+        t, questions, histories = memory["t"], memory["q_t"], memory["H_t"]
+        if t <= 1:
+            return tf.constant(0.0, tf.float32)
+        available = [tf.reduce_sum(questions[i], axis=0) for i in range(1, t) if i in questions]
+        if not available or t not in histories:
+            return tf.constant(0.0, tf.float32)
+        question = tf.math.l2_normalize(tf.add_n(available), axis=0)
+        history = tf.math.l2_normalize(histories[t], axis=0)
+        return tf.maximum(tf.reduce_sum(question * history), 0.0)
 
-        if t == 1: return 0
-        
-        H_t = state_memory.get('H_t').get(t, tf.zeros(d))
-        q_t = state_memory.get('q_t')
-        Q_t = tf.zeros(d)
-        n = len(q_t)
-        
-        for i in range(1, t):
-            for j in range(n):
-                Q_t += q_t[i][j]
-        
-        Q_t = tf.nn.l2_normalize(Q_t, 0)
-        H_t = tf.nn.l2_normalize(H_t, 0)
-
-        cos_sim = tf.reduce_sum(tf.math.multiply(Q_t, H_t))
-
-        return max(cos_sim, 0)
+    def get_transition_reward(self, cur_state, action, next_state, answers):
+        # Reward shaping is detached from the policy-gradient objective below.
+        hit = float(next_state.e_t in answers)
+        shaped = self.gamma * self.phi(next_state) - self.phi(cur_state)
+        return tf.stop_gradient(tf.cast(hit, tf.float32) + shaped)
 
 
-class Environment():
-    def __init__(self, knowledge_graph, start_state: State = None, rewards_func: Rewards = None):
+class Environment:
+    def __init__(self, knowledge_graph, start_state=None, rewards_func=None):
         self.knowledge_graph = knowledge_graph
-        self.start_state = start_state
-        self.current_state = start_state
-        if not rewards_func:
-            self.rewards_func = Rewards()
+        self.start_state = self.current_state = start_state
+        self.rewards_func = rewards_func if rewards_func is not None else Rewards()
+        self.ans = frozenset()
 
-    def transit(self, action, t, q_t, H_t):
-        new_state = self.get_next_state(action)
-        new_state.set_memory(t+1, q_t, H_t)
-        new_reward = self.get_transition_reward(self.current_state, action, new_state)
-        self.current_state = new_state
-        return new_state, new_reward
-
-    def start_new_query(self, state: State, ans):
-        self.start_state = state
-        self.current_state = state
-        self.ans = ans
+    def start_new_query(self, state, ans):
+        self.start_state = self.current_state = state
+        self.ans = frozenset(ans) if isinstance(ans, (set, frozenset, list, tuple)) else frozenset((ans,))
         return self
 
-    def get_next_state(self, action):
-        # action = (relation, node)
-        assert self.knowledge_graph.has_edge(self.current_state.e_t, action[1]), "Transition Error: This action does not exist for current node: {}".format(self.current_state)
-
-        for neighbour, edge in self.knowledge_graph[self.current_state.e_t].items():
-            if edge['relation'] == action[0]:
-                new_state = State(self.current_state.q, self.current_state.e_s, neighbour, set(self.current_state.h_t) | {action})
-                break
-        
-        return new_state
-
     def get_possible_actions(self):
-        assert self.knowledge_graph.has_node(self.current_state.e_t), "State Error: No such node in graph"
+        node = self.current_state.e_t
+        if not self.knowledge_graph.has_node(node):
+            return []
+        if self.knowledge_graph.is_multigraph():
+            return [(data["relation"], target)
+                    for _, target, data in self.knowledge_graph.out_edges(node, data=True)]
+        return [(data["relation"], target)
+                for _, target, data in self.knowledge_graph.out_edges(node, data=True)]
 
-        action_space = [(edge['relation'], neighbour) for neighbour, edge in self.knowledge_graph[self.current_state.e_t].items()]
-        return action_space
+    def get_next_state(self, action):
+        relation, neighbor = action
+        if action not in self.get_possible_actions():
+            raise ValueError("Invalid directed relation/target transition: {}".format(action))
+        state = self.current_state
+        return State(state.q, state.e_s, neighbor, state.h_t | {(state.e_t, relation, neighbor)})
 
-    def get_action_reward(self, action):
-        cur_state = self.current_state
-        next_state = self.get_next_state(action)
-        return self.rewards_func.get_transition_reward(cur_state, action, next_state, self.ans)
-
-    def get_transition_reward(self, s_0: State, action, s_1: State):
-        return self.rewards_func.get_transition_reward(s_0, action, s_1, self.ans)
-
+    def transit(self, action, t, q_t, H_t):
+        next_state = self.get_next_state(action).set_memory(t + 1, q_t, H_t)
+        reward = self.rewards_func.get_transition_reward(self.current_state, action, next_state, self.ans)
+        self.current_state = next_state
+        return next_state, reward

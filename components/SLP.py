@@ -10,8 +10,8 @@ class SLP(layers.Layer):
         for t in range(1, T+1):
             weight = 'weights_{}'.format(t)
             bias = 'biases_{}'.format(t)
-            w = tf.Variable(initializer([d, d]), trainable=True)
-            b = tf.Variable(initializer([d]), trainable=True)
+            w = self.add_weight(name=weight, shape=(d, d), initializer="glorot_normal")
+            b = self.add_weight(name=bias, shape=(d,), initializer="glorot_normal")
             setattr(self, weight, w)
             setattr(self, bias, b)
     
