@@ -71,15 +71,44 @@ python prepare_embeddings.py \
 # Download the pretrained GloVe 6B, 50-dimensional text file separately,
 # then train SRN using *only answers* as QA supervision.
 python theseus_experiment.py --dataset kinship --hops 2 --mode train \
-  --glove /path/to/glove.6B.50d.txt
+  --glove datasets/embeddings/glove.6B.50d.txt
 
 # Evaluate an existing checkpoint without retraining.
 python theseus_experiment.py --dataset kinship --hops 2 --mode evaluate \
-  --glove /path/to/glove.6B.50d.txt
+  --glove datasets/embeddings/glove.6B.50d.txt
 ```
 
-The GloVe vectors can be obtained from the original
-[Stanford GloVe distribution](https://nlp.stanford.edu/projects/glove/).
+### Download GloVe from Zenodo
+
+The [Zenodo GloVe 6B mirror](https://zenodo.org/records/4925376)
+provides the same Stanford GloVe 6B vocabulary in separate dimensions.
+**Download `glove.6B.50d.zip` (58.9 MB)**, not the 100d, 200d, or 300d
+archives. SRN's original question and relation encoders use 50-dimensional
+vectors.
+
+The Zenodo archive contains **binary Word2Vec-format vectors**, not the
+plain-text GloVe file expected by `components/Embedder.py`. Convert it
+once before running SRN. From the repository root:
+
+```bash
+# Install the optional conversion dependency.
+python -m pip install gensim
+
+# Replace this filename if you saved the ZIP elsewhere.
+python -m zipfile -e glove.6B.50d.zip datasets/embeddings
+
+# Find the extracted .bin file and convert it to text.
+python -c "from pathlib import Path; from gensim.models import KeyedVectors; src = next(Path('datasets/embeddings').rglob('*.bin')); KeyedVectors.load_word2vec_format(str(src), binary=True).save_word2vec_format('datasets/embeddings/glove.6B.50d.txt', binary=False)"
+```
+
+The resulting `datasets/embeddings/glove.6B.50d.txt` works with
+`--glove datasets/embeddings/glove.6B.50d.txt`. The text export has
+a Word2Vec header (`400000 50`), which the SRN text loader skips.
+These vectors initialize **word embeddings**, not KG entity/relation
+embeddings. The separate TransE preparation step is still required.
+The original [Stanford GloVe distribution](https://nlp.stanford.edu/projects/glove/)
+is an alternative source for the text file if reachable.
+
 The original SRN code relied on a Freebase-specific GloVe + TransE package,
 which cannot be used directly for the Kinship or Wikidata relation vocabulary.
 `prepare_embeddings.py` supplies an **optional independent TransE pretraining**
@@ -107,7 +136,7 @@ python prepare_embeddings.py \
   --graph datasets/theseus/mquake-st/kg/triplets.txt \
   --output saved_models/theseus_mquake-st_multi_3/transe_relations.npz
 python theseus_experiment.py --dataset mquake-st --hops 3 \
-  --answer-mode multi --glove /path/to/glove.6B.50d.txt
+  --answer-mode multi --glove datasets/embeddings/glove.6B.50d.txt
 ```
 
 The loader uses the **official `SplitLabel`**, explicit `Source-Entity`, and
