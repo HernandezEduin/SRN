@@ -211,14 +211,17 @@ be compared directly with agents that infer their own stopping behavior.
 
 ### Live training and evaluation progress
 
-Training prints the start of every epoch and a progress heartbeat every 15
-seconds by default, including examples completed, elapsed time and estimated
-remaining time. The heartbeat runs independently of per-question execution,
-so a long first GPU compilation step still produces status updates.
-Development and final test beam-search evaluations have their own progress
-indicators. Each epoch reports when checkpoint saving starts and ends.
+Interactive terminals display `tqdm` progress bars for every training epoch,
+development evaluation, and final dev/test evaluation. Training bars show the
+number of questions processed, elapsed time, throughput, estimated time remaining,
+running loss, and Hits@1. The bar refreshes every 15 seconds by default, even
+if a single query is taking a long time (for example, first-run CUDA compilation).
 
-Set the reporting frequency without changing model training:
+When output is redirected to a file or the terminal is non-interactive,
+SRN instead prints plain-text progress heartbeats. Checkpoint messages,
+per-epoch metric summaries, and `metrics.csv` are retained in both modes.
+
+Set the refresh frequency without changing model training:
 
 ```bash
 python theseus_experiment.py --dataset kinship --hops 3 --mode train \
@@ -227,12 +230,14 @@ python theseus_experiment.py --dataset kinship --hops 3 --mode train \
   --progress-seconds 10
 ```
 
-Set `--progress-seconds 0` to disable periodic heartbeats (stage
-start/end messages remain). ETA is approximate, especially during first-run
-CUDA PTX compilation. In addition to accuracy and loss, `metrics.csv` now
-records `train_seconds`, `dev_seconds` and `epoch_seconds`.
-Progress instrumentation does not change the loss, optimizer, rollout,
-reward or evaluation policy.
+Set `--progress-style tqdm` to force bars, or `--progress-style plain` to
+force log-friendly text. The default `--progress-style auto` uses bars only
+when stderr is a terminal. `--progress-seconds 0` disables background
+refreshes but keeps per-query bars or stage-start/end logs. ETA is approximate,
+especially during first-run CUDA PTX compilation. `metrics.csv` records
+`train_seconds`, `dev_seconds` and `epoch_seconds` in addition to
+accuracy and loss. Progress instrumentation does not change the loss,
+optimizer, rollout, reward or evaluation policy.
 
 ### Training and results
 
