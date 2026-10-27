@@ -87,8 +87,9 @@ archives. SRN's original question and relation encoders use 50-dimensional
 vectors.
 
 The Zenodo archive contains **binary Word2Vec-format vectors**, not the
-plain-text GloVe file expected by `components/Embedder.py`. Convert it
-once before running SRN. From the repository root:
+plain-text GloVe file expected by `components/Embedder.py`. The extracted
+file has **no `.bin` extension** (`glove.6B.50d`). Convert it once before
+running SRN. From the repository root:
 
 ```bash
 # Install the optional conversion dependency.
@@ -97,8 +98,12 @@ python -m pip install gensim
 # Replace this filename if you saved the ZIP elsewhere.
 python -m zipfile -e glove.6B.50d.zip datasets/embeddings
 
-# Find the extracted .bin file and convert it to text.
-python -c "from pathlib import Path; from gensim.models import KeyedVectors; src = next(Path('datasets/embeddings').rglob('*.bin')); KeyedVectors.load_word2vec_format(str(src), binary=True).save_word2vec_format('datasets/embeddings/glove.6B.50d.txt', binary=False)"
+# Zenodo stores an extensionless binary file named glove.6B.50d.
+# Convert that specific file to the text format expected by SRN.
+python -c "from gensim.models import KeyedVectors; KeyedVectors.load_word2vec_format('datasets/embeddings/glove.6B.50d', binary=True).save_word2vec_format('datasets/embeddings/glove.6B.50d.txt', binary=False)"
+
+# Optional sanity check: the first line should read '400000 50'.
+head -n 1 datasets/embeddings/glove.6B.50d.txt
 ```
 
 The resulting `datasets/embeddings/glove.6B.50d.txt` works with
