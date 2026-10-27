@@ -33,9 +33,13 @@ def argument_parser():
     parser.add_argument("--sensitivity-pairs", type=int, default=0,
                         help="Compare first-hop action distributions for N question pairs sharing a source")
     parser.add_argument("--max-actions", type=int, default=200)
+    parser.add_argument("--max-hops", type=int, default=None,
+                        help="Global rollout horizon T (default: maximum hop length in selected split). "
+                             "Per-question annotated hops are never used to control rollout.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default=None, help="Required for evaluation")
-    parser.add_argument("--oracle-hops", action="store_true", help="Explicitly allow using annotated hop lengths for mixed n-hop data")
+    parser.add_argument("--oracle-hops", action="store_true",
+                        help="Deprecated and ignored. SRN now learns STOP without annotated hop horizons.")
     parser.add_argument("--limit", type=int, default=None, help="Debug only: limit each split to N rows")
     parser.add_argument("--progress-seconds", type=float, default=15.0,
                         help="Progress heartbeat frequency in seconds (0 disables periodic heartbeat)")
@@ -155,6 +159,7 @@ def question_sensitivity(policy, records, count):
     """
     import numpy as np
     import tensorflow as tf
+    from Environment import STOP_RELATION
 
     first_by_source, used_sources, pairs = {}, set(), []
     for record in records:
@@ -175,6 +180,7 @@ def question_sensitivity(policy, records, count):
         source = first[1]
         actions = [(data["relation"], target)
                    for _, target, data in policy.graph.out_edges(source, data=True)]
+        actions.append((STOP_RELATION, source))
         if len(actions) < 2:
             continue
 
@@ -199,6 +205,7 @@ def question_sensitivity(policy, records, count):
             "max_probability_difference": float(difference.max()),
             "same_top_action": first_best == second_best,
             "top_actions": [list(actions[first_best]), list(actions[second_best])],
+            "stop_probabilities": [float(first_prob[-1]), float(second_prob[-1])],
         })
     return {
         "requested_pairs": count,
@@ -232,10 +239,15 @@ def main():
         raise SystemExit("--progress-seconds must be non-negative")
     if args.dev_every < 1 or args.sensitivity_pairs < 0 or args.beam_size < 1:
         raise SystemExit("--dev-every and --beam-size must be positive; --sensitivity-pairs must be non-negative")
+    if args.max_actions < 2:
+        raise SystemExit("--max-actions must be at least 2 to retain STOP alongside KG edges")
+    if args.max_hops is not None and args.max_hops < 1:
+        raise SystemExit("--max-hops must be positive")
     if args.mode == "diagnose" and args.sensitivity_pairs == 0:
         raise SystemExit("--mode diagnose requires --sensitivity-pairs N (N > 0)")
-    if args.hops == "n" and args.mode != "download" and not args.oracle_hops:
-        raise SystemExit("Mixed-hop SRN requires annotated horizons. Pass --oracle-hops to acknowledge this non-comparable setting, or use --hops 2/3/4")
+    if args.oracle_hops:
+        print("Warning: --oracle-hops is deprecated and ignored. "
+              "Rollouts use fixed T with learned STOP.", flush=True)
     graph, splits, graph_path = load_release(args.dataset, args.hops, args.answer_mode, args.data_root)
     print("Graph: {} nodes, {} directed triples. Splits: {}".format(
         graph.number_of_nodes(), graph.number_of_edges(),
@@ -272,7 +284,12 @@ def main():
     missing = graph_relations - set(embedder.relation_embedding)
     if missing:
         raise ValueError("Missing {} graph relation embeddings, e.g. {}".format(len(missing), sorted(missing)[:5]))
-    max_hops = max(record[3] for rows in splits.values() for record in rows)
+    # The dataset hop column is used only to choose a dataset-level default T.
+    # It must never control an individual train/eval rollout.
+    max_hops = args.max_hops if args.max_hops is not None else max(
+        record[3] for rows in splits.values() for record in rows)
+    print("SRN rollout horizon T={} with learned STOP (no gold-hop oracle)".format(
+        max_hops), flush=True)
     policy = TheseusSRN(graph, embedder, max_hops, learning_rate=args.learning_rate,
                         beam_size=args.beam_size, max_actions=args.max_actions)
     checkpoint = tf.train.Checkpoint(model=policy, optimizer=policy.optimizer)

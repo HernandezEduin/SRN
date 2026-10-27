@@ -3,12 +3,15 @@
 import tensorflow as tf
 
 d = 50
+STOP_RELATION = "__SRN_STOP__"
 
 
 class State:
-    def __init__(self, q, e_s, e_t, h_t=None, t=1, q_t=None, H_t=None):
+    def __init__(self, q, e_s, e_t, h_t=None, t=1, q_t=None, H_t=None,
+                 terminal=False):
         self.q, self.e_s, self.e_t = q, e_s, e_t
         self.h_t = set() if h_t is None else h_t
+        self.terminal = terminal
         self.memory = {"t": t, "q_t": {} if q_t is None else q_t,
                        "H_t": {} if H_t is None else H_t}
 
@@ -27,7 +30,9 @@ class Rewards:
     def phi(self, state):
         memory = state.get_memory()
         t, questions, histories = memory["t"], memory["q_t"], memory["H_t"]
-        if t <= 1:
+        # The absorbing terminal state has zero potential. This includes
+        # selecting STOP early or reaching the fixed rollout horizon.
+        if state.terminal or t <= 1:
             return tf.constant(0.0, tf.float32)
         available = [tf.reduce_sum(questions[i], axis=0) for i in range(1, t) if i in questions]
         if not available or t not in histories:
@@ -53,11 +58,16 @@ class Rewards:
 
 
 class Environment:
-    def __init__(self, knowledge_graph, start_state=None, rewards_func=None):
+    def __init__(self, knowledge_graph, start_state=None, rewards_func=None,
+                 allow_stop=False):
         self.knowledge_graph = knowledge_graph
         self.start_state = self.current_state = start_state
         self.rewards_func = rewards_func if rewards_func is not None else Rewards()
+        self.allow_stop = allow_stop
         self.ans = frozenset()
+        if allow_stop and any(data["relation"] == STOP_RELATION
+                              for _, _, data in knowledge_graph.edges(data=True)):
+            raise ValueError("KG relation collides with reserved SRN STOP label")
 
     def start_new_query(self, state, ans):
         self.start_state = self.current_state = state
@@ -65,24 +75,38 @@ class Environment:
         return self
 
     def get_possible_actions(self):
+        if self.current_state is None or self.current_state.terminal:
+            return []
         node = self.current_state.e_t
         if not self.knowledge_graph.has_node(node):
             return []
-        if self.knowledge_graph.is_multigraph():
-            return [(data["relation"], target)
-                    for _, target, data in self.knowledge_graph.out_edges(node, data=True)]
-        return [(data["relation"], target)
-                for _, target, data in self.knowledge_graph.out_edges(node, data=True)]
+        actions = [(data["relation"], target)
+                   for _, target, data in self.knowledge_graph.out_edges(
+                       node, data=True)]
+        if self.allow_stop:
+            # Paper Sec. 2.2: a self-loop is a learnable terminal action.
+            actions.append((STOP_RELATION, node))
+        return actions
 
     def get_next_state(self, action):
         relation, neighbor = action
         if action not in self.get_possible_actions():
             raise ValueError("Invalid directed relation/target transition: {}".format(action))
         state = self.current_state
-        return State(state.q, state.e_s, neighbor, state.h_t | {(state.e_t, relation, neighbor)})
+        if self.allow_stop and relation == STOP_RELATION:
+            # A STOP action is not a KG evidence edge.
+            return State(state.q, state.e_s, state.e_t, state.h_t,
+                         terminal=True)
+        return State(state.q, state.e_s, neighbor,
+                     state.h_t | {(state.e_t, relation, neighbor)})
 
-    def transit(self, action, t, q_t, H_t):
-        next_state = self.get_next_state(action).set_memory(t + 1, q_t, H_t)
-        reward = self.rewards_func.get_transition_reward(self.current_state, action, next_state, self.ans)
+    def transit(self, action, t, q_t, H_t, end_of_horizon=False):
+        next_state = self.get_next_state(action)
+        if end_of_horizon:
+            next_state.terminal = True
+        next_state.set_memory(t + 1, q_t, H_t)
+        reward = self.rewards_func.get_transition_reward(
+            self.current_state, action, next_state, self.ans
+        )
         self.current_state = next_state
         return next_state, reward

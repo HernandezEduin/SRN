@@ -306,11 +306,55 @@ relations are preserved, and no graph inverses or extra gender edges are
 introduced. Gold `Paths`, `Paths-Label`, and relation chains are not consumed
 by the model. In multi-answer mode, reaching **any** released answer is correct.
 
-To avoid giving the agent a gold hop count at evaluation, we recommend fixed
-hop subsets (`--hops 2`, `3`, or `4`). Mixed `--hops n` is supported only with
-the explicit `--oracle-hops` acknowledgment because the original fixed-horizon
-SRN has no learned STOP action. Results using oracle horizons should **not**
-be compared directly with agents that infer their own stopping behavior.
+### Paper-aligned STOP action and mixed-hop navigation
+
+The published [SRN paper](https://doi.org/10.1145/3336191.3371812)
+(Section 2.2) adds a **self-loop STOP action** to the outgoing edges at every
+entity. Choosing STOP preserves the current entity and ends the episode in an
+absorbing state. A question can therefore finish earlier than the shared
+maximum rollout horizon `T`, without consulting its annotated hop length.
+This is how SRN supports mixed-hop questions. The archived third-party
+`experiment.py` did not implement that STOP action, but this THESEUS adapter
+now does.
+
+For example, train and evaluate on the mixed-hop Kinship split:
+
+```bash
+python theseus_experiment.py --dataset kinship --hops n --mode train \
+  --max-hops 3 \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --relation-embeddings saved_models/kinship_transe/relations.npz \
+  --output saved_models/kinship_srn_mixed_stop \
+  --seed 42
+python theseus_experiment.py --dataset kinship --hops n --mode evaluate \
+  --max-hops 3 \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --relation-embeddings saved_models/kinship_transe/relations.npz \
+  --output saved_models/kinship_srn_mixed_stop
+```
+
+For MQuAKE-ST mixed-hop, set `--dataset mquake-st --hops n --max-hops 4`.
+The default `T` is the maximum annotated hop count **across the selected
+split**, not the length of each individual question. You can explicitly set
+`--max-hops` for a common horizon across conditions. During both training
+and prediction, the model chooses its own stopping step. The `Hops` column
+is retained only as evaluation metadata. `--oracle-hops` is deprecated and
+ignored, so it cannot silently reintroduce an oracle.
+
+The STOP action uses its own trainable 50-dimensional relation vector, while
+ordinary KG relations continue to use the **same frozen TransE relation vectors**
+in `transe_relations.npz`. The paper defines STOP but does not prescribe a
+specific vector initializer. This adapter uses a small random initializer,
+which is an explicit implementation choice rather than a claimed exact
+reproduction. No new relation is inserted into the KG or its TransE export.
+Predicted evidence paths contain only real graph triples, and
+`dev_predictions.jsonl` and `test_predictions.jsonl` report
+`predicted_hops` and `stop_reason` (learned STOP or maximum horizon).
+
+**Checkpoint compatibility:** The learned STOP parameter changes the policy
+checkpoint structure and rollout distribution. Retrain with a **new output
+directory**. Do not compare these checkpoints directly with pre-STOP SRN
+checkpoints without reporting the change.
 
 ### Published SRN reward and beam-search efficiency
 
@@ -323,18 +367,18 @@ The potential shaping term remains
 `gamma * phi(next_state) - phi(current_state)`, and the policy continues to use
 on-policy REINFORCE without reference-path supervision.
 
-Previous THESEUS SRN checkpoints were trained with an intermediate-answer
-reward and should **not** be mixed into experiments using the corrected
-objective. Use a new `--output` directory and retrain from scratch when
-comparing results.
+Earlier THESEUS SRN checkpoints used an intermediate-answer reward and
+some used annotated per-question hop limits. These are **not equivalent** to
+the paper-aligned STOP policy. Use a new `--output` directory and retrain
+from scratch when comparing results.
 
-Evaluation keeps the same learned relation scores and global beam ordering,
-but computes candidate relation scores in batches, advances GRU histories
-only for branches surviving beam pruning, and omits unnecessary history
-updates at the final step. This avoids a large number of tiny TensorFlow
-operations during development/test evaluation. The result is intended to
-preserve the exact inference decisions, aside from ordinary floating-point
-roundoff. Actual speedup will depend on GPU, KG branching and beam width.
+Evaluation computes relation scores in batches and advances GRU histories
+only for branches surviving beam pruning. Completed STOP branches retain their
+scores while other beams continue until `T`. Selecting STOP or reaching `T`
+makes a branch terminal. This avoids unnecessary GRU computations and allows
+a learned early finish. Unlike the previous fixed-length beam search, STOP
+adds a real decision to the probability distribution and can change rankings.
+Actual speed will depend on GPU, KG branching and beam width.
 
 To reduce frequent expensive dev runs while retaining full evaluation on the
 final epoch, set `--dev-every N`, for example:
@@ -357,9 +401,10 @@ existing `--beam-size` setting (default 32).
 
 To investigate whether distinct questions sharing a topic entity produce
 different relation preferences, SRN offers a **gold-blind** first-hop test.
-It compares softmax distributions on exactly the same outgoing KG actions,
-recording total variation, the maximum probability difference, and whether
-the top-ranked action changes. No answer labels are inspected.
+It compares softmax distributions on exactly the same outgoing KG actions
+**including STOP**, recording total variation, the maximum probability
+difference, the STOP probabilities, and whether the top-ranked action changes.
+No answer labels are inspected.
 
 After training, with the saved model directory containing both the checkpoint
 and relation NPZ:
@@ -410,10 +455,10 @@ optimizer, rollout, reward or evaluation policy.
 
 ### Training and results
 
-The model currently uses 50d GloVe inputs, frozen TransE relation
-vectors, BiGRU question encoder, hop-specific SLP, relation attention,
-semantic perceptron, GRU history, answer-level potential-based reward shaping,
-and REINFORCE. It does **not** introduce evidence-path supervision or a new
+The model currently uses 50d GloVe inputs, frozen TransE KG relation
+vectors, a separate learned STOP relation vector, BiGRU question encoder,
+hop-specific SLP, relation attention, semantic perceptron, GRU history,
+answer-level potential-based reward shaping, and REINFORCE. It does **not** introduce evidence-path supervision or a new
 loss. The executable path repairs issues in the archived third-party code,
 including malformed attention tensor shapes, GRU history handling, use of the
 policy-gradient loss, and label-dependent action pruning at evaluation.
