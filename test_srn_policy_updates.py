@@ -1,6 +1,8 @@
 """Regression checks for SRN's paper-aligned rewards, STOP and beam search."""
 
 import unittest
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
@@ -204,6 +206,31 @@ class SRNPolicyUpdatesTests(unittest.TestCase):
         self.assertEqual(prediction, "C")
         self.assertIsNotNone(loss)
         self.assertEqual(len(policy.trainable_variables), initial_weights)
+
+    def test_diagnosis_restores_a_fully_built_checkpoint(self):
+        """Restoration must not leave Keras GRU cells without their biases."""
+        from theseus_experiment import question_sensitivity
+
+        tf.random.set_seed(42)
+        original = self.make_policy(max_hops=3)
+        original._initialize_optimizer()
+        questions = [
+            (["who", "is", "mother"], "A", {"B"}, 1, "q1"),
+            (["who", "is", "father"], "A", {"C"}, 3, "q2"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = tf.train.Checkpoint(
+                model=original, optimizer=original.optimizer
+            ).save(str(Path(directory) / "ckpt"))
+
+            restored = self.make_policy(max_hops=3)
+            restored._initialize_optimizer()
+            tf.train.Checkpoint(
+                model=restored, optimizer=restored.optimizer
+            ).restore(path).expect_partial()
+            report = question_sensitivity(restored, questions, count=1)
+            self.assertEqual(report["pairs_evaluated"], 1)
+            self.assertEqual(len(report["pairs"][0]["stop_probabilities"]), 2)
 
     def test_mixed_hop_cli_does_not_require_oracle(self):
         from theseus_experiment import argument_parser

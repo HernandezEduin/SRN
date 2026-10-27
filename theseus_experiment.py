@@ -292,6 +292,10 @@ def main():
         max_hops), flush=True)
     policy = TheseusSRN(graph, embedder, max_hops, learning_rate=args.learning_rate,
                         beam_size=args.beam_size, max_actions=args.max_actions)
+    # Keras 3 may mark an RNN as built while restoring a deferred checkpoint,
+    # before its GRUCell variables exist. Materialize every layer and optimizer
+    # slot first, for train, evaluate, and diagnose alike.
+    policy._initialize_optimizer()
     checkpoint = tf.train.Checkpoint(model=policy, optimizer=policy.optimizer)
     manager = tf.train.CheckpointManager(checkpoint, str(output / "checkpoints"), max_to_keep=3)
     if args.checkpoint:

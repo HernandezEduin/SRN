@@ -139,9 +139,11 @@ the current terminal session. The system-installed NVIDIA driver and CUDA
 toolkit do not need to be replaced.
 
 For Keras 3 / TensorFlow 2.21, the THESEUS SRN policy initializes every
-hop-specific SLP layer and the history GRU before its first optimizer step.
-This prevents an `Unknown variable: slp/weights_2` error if the first sampled
-trajectory stops early. The one-time initialization may add startup latency,
+hop-specific SLP layer, RNN cell, and optimizer slot **before checkpoint
+restoration or the first optimizer step**. This prevents both the
+`Unknown variable: slp/weights_2` training error and a missing
+`GRUCell.bias` after restoring a saved model in `--mode evaluate` or
+`--mode diagnose`. The one-time initialization may add startup latency,
 but it does not use reference paths, answers, or annotated hop counts.
 
 ### Download GloVe from Zenodo
