@@ -68,7 +68,9 @@ class TheseusSRN(tf.keras.Model):
 
     def relation_vector(self, relation):
         if relation == STOP_RELATION:
-            return self.stop_relation
+            # Keras 3 Variable.dtype is a string, which tf.stack cannot use
+            # directly. Tensor conversion preserves gradients into this weight.
+            return tf.convert_to_tensor(self.stop_relation, dtype=tf.float32)
         vector = self.Embedder.embed_relation(relation)
         if vector is None:
             raise ValueError("Missing frozen TransE vector for relation {}".format(relation))

@@ -117,6 +117,11 @@ class SRNPolicyUpdatesTests(unittest.TestCase):
 
         policy = self.make_policy()
         self.assertTrue(policy.stop_relation.trainable)
+        stop_tensor = policy.relation_vector(STOP_RELATION)
+        self.assertIsInstance(stop_tensor, tf.Tensor)
+        self.assertEqual(stop_tensor.dtype, tf.float32)
+        # Also exercise initialization, which previously failed in tf.stack.
+        policy._initialize_optimizer()
         with tf.GradientTape() as tape:
             scores = policy.action_scores(
                 tf.ones((4, 50)), tf.zeros(50),
