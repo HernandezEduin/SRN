@@ -167,6 +167,39 @@ class SRNPolicyUpdatesTests(unittest.TestCase):
         self.assertEqual(first[1], [
             ("A", "forward", "B"), ("B", "forward", "C")])
 
+    def test_optimizer_prebuilds_all_hops_and_history_before_first_update(self):
+        """Keras 3 must accept weights used only on later, longer episodes."""
+        from Environment import STOP_RELATION
+
+        policy = self.make_policy(max_hops=3)
+        original_scores = policy.action_scores
+        preference = {"stop": True}
+
+        def biased_scores(question, history, actions):
+            scores = original_scores(question, history, actions)
+            bias = tf.constant([
+                20.0 if (relation == STOP_RELATION) == preference["stop"]
+                else -20.0
+                for relation, _ in actions
+            ], tf.float32)
+            return scores + bias
+
+        policy.action_scores = biased_scores
+        # First update ends at source via STOP.
+        short = (["who", "is", "mother"], "A", {"A"}, 1, "short")
+        policy.train_query(short)
+        self.assertTrue(policy._optimizer_initialized)
+        initial_weights = len(policy.trainable_variables)
+
+        # Second update uses both KG edges and additional hop-specific SLP
+        # weights, which used to trigger Keras's "Unknown variable" error.
+        preference["stop"] = False
+        long = (["who", "is", "mother"], "A", {"C"}, 3, "long")
+        prediction, loss, _ = policy.train_query(long)
+        self.assertEqual(prediction, "C")
+        self.assertIsNotNone(loss)
+        self.assertEqual(len(policy.trainable_variables), initial_weights)
+
     def test_mixed_hop_cli_does_not_require_oracle(self):
         from theseus_experiment import argument_parser
 

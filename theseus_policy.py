@@ -36,6 +36,31 @@ class TheseusSRN(tf.keras.Model):
         self.Perceptron = Perceptron()
         self.GRU = GRU()
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        self._optimizer_initialized = False
+
+    def _initialize_optimizer(self):
+        """Build all SRN layers and register every weight before the first update.
+
+        A sampled STOP on the first question may bypass the history GRU and
+        later hop-specific SLP weights. Keras 3 optimizers refuse weights that
+        were absent from their original build, so initialize the complete
+        policy regardless of the first sampled trajectory.
+        """
+        if self._optimizer_initialized:
+            return
+        question = self.BiGRU(tf.zeros((1, 1, d), tf.float32), training=False)
+        for hop in range(1, self.max_hops + 1):
+            self.SLP(question, t=hop)
+        self.GRU(tf.zeros((d,), tf.float32), training=False)
+        # The attention/perceptron currently add weights in __init__. Exercise
+        # their score path too, so their variables are initialized if that
+        # implementation changes.
+        self.action_scores(
+            question, tf.zeros((d,), tf.float32),
+            [(STOP_RELATION, None)],
+        )
+        self.optimizer.build(self.trainable_variables)
+        self._optimizer_initialized = True
 
     def encode(self, words, training=False):
         vectors = np.stack([self.Embedder.embed_word(word) for word in words])
@@ -91,6 +116,7 @@ class TheseusSRN(tf.keras.Model):
         return [actions[index] for index in indices], tf.gather(logits, indices)
 
     def train_query(self, record):
+        self._initialize_optimizer()
         words, start, answers, _, _ = record
         # Gold hop annotations must never determine the number of rollout steps.
         with tf.GradientTape() as tape:

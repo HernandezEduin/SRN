@@ -138,6 +138,12 @@ may warn that kernels will be JIT-compiled from PTX. Successful execution on
 the current terminal session. The system-installed NVIDIA driver and CUDA
 toolkit do not need to be replaced.
 
+For Keras 3 / TensorFlow 2.21, the THESEUS SRN policy initializes every
+hop-specific SLP layer and the history GRU before its first optimizer step.
+This prevents an `Unknown variable: slp/weights_2` error if the first sampled
+trajectory stops early. The one-time initialization may add startup latency,
+but it does not use reference paths, answers, or annotated hop counts.
+
 ### Download GloVe from Zenodo
 
 The [Zenodo GloVe 6B mirror](https://zenodo.org/records/4925376)
