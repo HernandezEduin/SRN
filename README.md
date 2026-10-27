@@ -143,8 +143,8 @@ toolkit do not need to be replaced.
 The [Zenodo GloVe 6B mirror](https://zenodo.org/records/4925376)
 provides the same Stanford GloVe 6B vocabulary in separate dimensions.
 **Download `glove.6B.50d.zip` (58.9 MB)**, not the 100d, 200d, or 300d
-archives. SRN's original question and relation encoders use 50-dimensional
-vectors.
+archives. This THESEUS adapter currently uses 50-dimensional
+vectors. The published SRN paper reports a 300-dimensional configuration.
 
 The Zenodo archive contains **binary Word2Vec-format vectors**, not the
 plain-text GloVe file expected by `components/Embedder.py`. The extracted
@@ -173,6 +173,36 @@ These vectors initialize **word embeddings**, not KG entity/relation
 embeddings. The separate TransE preparation step is still required.
 The original [Stanford GloVe distribution](https://nlp.stanford.edu/projects/glove/)
 is an alternative source for the text file if reachable.
+
+### Verify GloVe vocabulary coverage
+
+SRN checks GloVe coverage **before training or evaluation**, using the exact
+lowercased tokens produced by `theseus_data.question_tokens` and consumed by
+`Embedder.embed_word`. Like the UHop preprocessing diagnostic, it reports
+coverage for both unique words and word occurrences. SRN additionally reports
+these metrics separately for train, dev, and test, and lists the most frequent
+out-of-vocabulary (OOV) tokens. No extra tokenizer, vocabulary expansion, or
+training change is introduced.
+
+For example, the startup log includes:
+
+```text
+GloVe vocabulary coverage (50d, SRN question tokens):
+  all: unique <matched>/<total> (<percent>), occurrences <matched>/<total> (<percent>)
+  train: ...
+  dev: ...
+  test: ...
+  Excluded special tokens: {'<e>': <count>}
+  Top GloVe OOV words (... total): ...
+GloVe coverage saved to saved_models/.../glove_coverage.json
+```
+
+The full `glove_coverage.json` retains all OOV words and their occurrence
+counts to support reproducibility. The `<e>` entity marker is intentionally
+represented by a zero vector in this implementation and is excluded from
+ordinary word coverage, although its occurrences are reported. **GloVe covers
+question words only**. TransE relation vectors are checked separately for all
+KG relation IDs.
 
 The original SRN code relied on a Freebase-specific GloVe + TransE package,
 which cannot be used directly for the Kinship or Wikidata relation vocabulary.
@@ -314,7 +344,7 @@ optimizer, rollout, reward or evaluation policy.
 
 ### Training and results
 
-The model retains the original SRN's 50d GloVe inputs, frozen TransE relation
+The model currently uses 50d GloVe inputs, frozen TransE relation
 vectors, BiGRU question encoder, hop-specific SLP, relation attention,
 semantic perceptron, GRU history, answer-level potential-based reward shaping,
 and REINFORCE. It does **not** introduce evidence-path supervision or a new
@@ -324,7 +354,7 @@ policy-gradient loss, and label-dependent action pruning at evaluation.
 Its beam search ranks by learned relation-policy scores, never gold answers.
 
 Outputs go to `saved_models/theseus_<dataset>_<mode>_<hops>/` and include
-`metrics.csv`, model checkpoints, and `dev_predictions.jsonl` and
+`metrics.csv`, `glove_coverage.json`, model checkpoints, and `dev_predictions.jsonl` and
 `test_predictions.jsonl` with explicit trajectories. `--seed` controls
 NumPy, TensorFlow, and training order. Use `--limit N` **only for debugging**.
 The original `experiment.py` and historical PathQuestion results are retained
@@ -333,5 +363,5 @@ as references, but the legacy environment is not guaranteed to run unchanged.
 Run adapter tests using:
 
 ```bash
-python -m unittest -v test_theseus_data.py test_prepare_embeddings.py
+python -m unittest -v test_theseus_data.py test_prepare_embeddings.py test_glove_coverage.py
 ```

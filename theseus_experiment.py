@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
+from glove_coverage import compute_glove_coverage, format_glove_coverage
 from theseus_data import load_release
 
 
@@ -174,6 +175,12 @@ def main():
     relation_path = args.relation_embeddings or str(output / "transe_relations.npz")
     vocabulary = {word for rows in splits.values() for record in rows for word in record[0]}
     embedder = Embedder(args.glove, relation_path, vocabulary)
+    glove_report = compute_glove_coverage(splits, embedder.word_embeddings)
+    print(format_glove_coverage(glove_report, embedder.dim), flush=True)
+    coverage_file = output / "glove_coverage.json"
+    coverage_file.write_text(json.dumps(glove_report, indent=2, ensure_ascii=False) + "\n",
+                             encoding="utf-8")
+    print("GloVe coverage saved to {}".format(coverage_file), flush=True)
     graph_relations = {data["relation"] for _, _, data in graph.edges(data=True)}
     missing = graph_relations - set(embedder.relation_embedding)
     if missing:
@@ -253,7 +260,8 @@ def main():
         save_predictions(output / (split + "_predictions.jsonl"), predictions)
         print("{} Hits@1 {:.4f} on {} examples".format(
             split, hits1, len(predictions)), flush=True)
-    print("Missing GloVe tokens: {}".format(len(embedder.missing_words)))
+    print("GloVe OOV tokens encountered during rollout (excluding <e>): {}".format(
+        len(embedder.missing_words - {"<e>"})))
 
 
 if __name__ == "__main__":
