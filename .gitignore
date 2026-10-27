@@ -153,3 +153,8 @@ cython_debug/
 
 # vscode
 .vscode
+
+# Downloaded THESEUS data and fixed pretrained embeddings
+datasets/theseus/
+datasets/embeddings/
+saved_models/theseus_*/

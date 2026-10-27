@@ -1,0 +1,4 @@
+# Separate from the unmaintained legacy environment in requirements.txt.
+tensorflow-cpu>=2.16,<2.19
+numpy>=1.26,<2.0
+networkx>=3.0,<4.0

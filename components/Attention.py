@@ -7,8 +7,8 @@ initializer = tf.keras.initializers.GlorotNormal()
 class Attention(layers.Layer):
     def __init__(self):
         super(Attention, self).__init__()
-        self.W = tf.Variable(initializer([d]), trainable=True)
-        self.b = tf.Variable(0, dtype=tf.float32, trainable=True)
+        self.W = self.add_weight(name="attention_weight", shape=(d,), initializer="glorot_normal")
+        self.b = self.add_weight(name="attention_bias", shape=(), initializer="zeros")
 
     def call(self, r_star, q_t):
         if r_star.shape == (d, 1):
@@ -16,10 +16,10 @@ class Attention(layers.Layer):
 
         r_star = tf.reshape(r_star, [d])
 
-        beta_stars = tf.map_fn(lambda w_t_m: self.beta_stars(r_star, w_t_m), q_t)
-        alpha_stars = tf.nn.softmax(beta_stars)
+        beta_stars = tf.reduce_sum(q_t * r_star[None, :] * self.W[None, :], axis=-1) + self.b
+        alpha_stars = tf.nn.softmax(beta_stars, axis=0)
         
-        q_t_stars = tf.math.multiply(alpha_stars, q_t)
+        q_t_stars = tf.math.multiply(alpha_stars[:, None], q_t)
         q_t_star = tf.reduce_sum(q_t_stars, 0)
 
         return q_t_star

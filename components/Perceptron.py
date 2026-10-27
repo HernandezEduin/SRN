@@ -7,8 +7,8 @@ initializer = tf.keras.initializers.GlorotNormal()
 class Perceptron(layers.Layer):
     def __init__(self):
         super(Perceptron, self).__init__()
-        self.W_L1 = tf.Variable(initializer([d, 2*d]), trainable=True)
-        self.W_L2 = tf.Variable(initializer([d]), trainable=True)
+        self.W_L1 = self.add_weight(name="semantic_w1", shape=(d, 2*d), initializer="glorot_normal")
+        self.W_L2 = self.add_weight(name="semantic_w2", shape=(d,), initializer="glorot_normal")
 
     def call(self, r_star, H_t, q_t_star):
         if r_star.shape == (d, 1):
