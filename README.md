@@ -57,26 +57,33 @@ An additional entry point, `theseus_experiment.py`, supports the official
 from [Theseus in the Graph](https://arxiv.org/abs/2609.14528). Run the following
 commands from the repository root with Python 3.10+.
 
-```bash
 # CPU-only installation. For NVIDIA GPUs, see the separate instructions below.
+```bash
 python -m pip install -r requirements_theseus.txt
+```
 
-# Download Kinship's original navigation KG and official two-hop QA split.
-python theseus_experiment.py --dataset kinship --hops 2 --mode download
+# Download Kinship's original navigation KG and official n-hop QA split.
+```bash
+python theseus_experiment.py --dataset kinship --hops n --mode download
+```
 
 # Independently pretrain 50d TransE relation vectors on the navigation KG.
+```bash
 python prepare_embeddings.py \
   --graph datasets/theseus/kinship/kg/orig/triplets.txt \
-  --output saved_models/theseus_kinship_single_2/transe_relations.npz
+  --output saved_models/kinship_transe/relations.npz \
+  --dim 50 \
+  --epochs 100
+```
 
 # Download the pretrained GloVe 6B, 50-dimensional text file separately,
 # then train SRN using *only answers* as QA supervision.
-python theseus_experiment.py --dataset kinship --hops 2 --mode train \
-  --glove datasets/embeddings/glove.6B.50d.txt
-
-# Evaluate an existing checkpoint without retraining.
-python theseus_experiment.py --dataset kinship --hops 2 --mode evaluate \
-  --glove datasets/embeddings/glove.6B.50d.txt
+```bash
+python theseus_experiment.py --dataset kinship --hops 3 --mode train \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --relation-embeddings saved_models/kinship_transe/relations.npz \
+  --output saved_models/kinship_srn \
+  --seed 42
 ```
 
 ### NVIDIA GPU setup (Linux)

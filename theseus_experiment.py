@@ -17,7 +17,7 @@ from theseus_data import load_release
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=("kinship", "mquake-st"), required=True)
-    parser.add_argument("--hops", choices=("2", "3", "4", "n"), default="2")
+    parser.add_argument("--hops", choices=("2", "3", "4", "n"), default="n")
     parser.add_argument("--answer-mode", choices=("single", "multi"), default="single")
     parser.add_argument("--mode", choices=("download", "train", "evaluate"), default="train")
     parser.add_argument("--data-root", default="datasets/theseus")
