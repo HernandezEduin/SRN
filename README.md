@@ -169,14 +169,80 @@ is an alternative source for the text file if reachable.
 
 The original SRN code relied on a Freebase-specific GloVe + TransE package,
 which cannot be used directly for the Kinship or Wikidata relation vocabulary.
-`prepare_embeddings.py` supplies an **optional independent TransE pretraining**
-implementation. It does not use QA labels or evidence paths. You may supply
-your own pretrained 50-dimensional TransE vectors with
-`--relation-embeddings /path/to/vectors.npz`. The NPZ file contains arrays
-`relations` (strings) and `vectors` (number of relations × 50, float32).
-Embedding provenance and pretraining hyperparameters must be reported in
-comparisons. This adapter is not a claim to reproduce the authors' unpublished
-pretrained Freebase vectors.
+`prepare_embeddings.py` independently trains **50-dimensional TransE** using
+only KG triples. No QA labels, questions, or reference paths are used.
+It uses head/tail corruption, a TransE L1 distance score, and the link-prediction
+logistic objective, following the relevant parts of
+[MultiHopKG's KGE trainer](https://github.com/HernandezEduin/MultiHopKG/blob/master/kge_train.py).
+This KGE pretraining is separate from SRN's original answer-reward REINFORCE
+training, which is unchanged.
+
+### TransE link-prediction validation and vector mapping
+
+TransE training first makes reproducible, disjoint **KG triple** partitions
+(default 80% train, 10% validation, 10% test). Every entity and relation must
+still appear in the training partition. Model selection uses validation
+**filtered MRR**. The held-out test partition is evaluated once after model
+selection, reporting filtered MRR, mean rank, and Hits@1/3/10 for **both**
+missing-head and missing-tail prediction. Filtering excludes other true KG
+triples from the competing candidates. These KGE splits are independent of
+the THESEUS **QA** splits.
+
+Run from the repository root:
+
+```bash
+python prepare_embeddings.py \
+  --graph datasets/theseus/kinship/kg/orig/triplets.txt \
+  --output saved_models/theseus_kinship_single_3/transe_relations.npz \
+  --epochs 100 --negatives 16 --eval-every 5 --seed 42 \
+  --refit-full
+```
+
+`--refit-full` is optional. After selecting an epoch count and evaluating on
+held-out triples, it initializes a new TransE model and trains on **all KG
+triples** for that many epochs to export SRN's relation vectors. The held-out
+scores in the JSON report describe the **validation-selected model before
+refitting**, not the final full-graph model. Omit `--refit-full` if you prefer
+to export the exact held-out-evaluated checkpoint.
+
+The outputs next to `transe_relations.npz` are:
+
+- `transe_relations.npz`: unchanged SRN-compatible `relations` and `vectors`
+  arrays with shape `(n_relations, 50)`.
+- `transe_relations.npz.entities.npz`: `entities` and `vectors` arrays with
+  shape `(n_entities, 50)` for inspecting the KGE entity representations.
+- `transe_relations.npz.training.csv`: per-epoch training loss and validation
+  metrics at evaluation epochs.
+- `transe_relations.npz.metrics.json`: reproducibility parameters, partition
+  sizes, best validation epoch, held-out metrics, and export provenance.
+
+**The mapping is stored inside each NPZ.** Specifically,
+`relations[i]` is the exact KG relation identifier whose vector is
+`vectors[i]`. `components/Embedder.py` reconstructs a dictionary with
+`dict(zip(relations, vectors))`, so there is no dependence on an implicit
+integer ordering across runs. The entity sidecar uses the same convention.
+To inspect actual identifiers and the first coordinates:
+
+```bash
+python -c "import numpy as np; d=np.load('saved_models/theseus_kinship_single_3/transe_relations.npz',allow_pickle=False); print([(str(name), v[:5].tolist()) for name,v in zip(d['relations'],d['vectors'])])"
+```
+
+This mapping uses **KG identifiers** (for example relation labels in Kinship
+or Wikidata PIDs in MQuAKE-ST), not GloVe word tokens. GloVe text embeddings
+remain separate.
+
+The trainer uses TensorFlow, so the existing GPU environment is sufficient.
+By default it evaluates at most 256 held-out triples per validation/test split,
+always ranking against **every graph entity**. Raise `--eval-samples` for
+more accurate estimates, or set it to `0` for full evaluation, which can be
+expensive on MQuAKE-ST. `--adversarial` enables self-adversarial negative
+weighting. The selected epoch and pretraining settings should be reported when
+comparing SRN baselines.
+
+You may also supply externally pretrained 50-dimensional TransE vectors using
+`--relation-embeddings /path/to/vectors.npz`, with the same two NPZ arrays.
+Our independent training is not a claim to reproduce the original SRN
+authors' unpublished Freebase embeddings.
 
 ### Available evaluations
 
@@ -260,5 +326,5 @@ as references, but the legacy environment is not guaranteed to run unchanged.
 Run adapter tests using:
 
 ```bash
-python -m unittest -v test_theseus_data.py
+python -m unittest -v test_theseus_data.py test_prepare_embeddings.py
 ```
