@@ -232,6 +232,53 @@ class SRNPolicyUpdatesTests(unittest.TestCase):
             self.assertEqual(report["pairs_evaluated"], 1)
             self.assertEqual(len(report["pairs"][0]["stop_probabilities"]), 2)
 
+    def test_question_sensitivity_traces_question_and_common_prefix(self):
+        from Environment import STOP_RELATION
+        from theseus_experiment import question_sensitivity
+
+        policy = self.make_policy(max_hops=3)
+        # Keep the same KG prefixes for both questions, without using gold
+        # annotations or predicting different paths.
+        policy.action_scores = lambda question, history, actions: tf.constant([
+            20.0 if relation != STOP_RELATION else -20.0
+            for relation, _ in actions], dtype=tf.float32)
+        records = [
+            (["who", "is", "mother"], "A", {"B"}, 1, "q1"),
+            (["who", "is", "father"], "A", {"C"}, 3, "q2"),
+        ]
+        report = question_sensitivity(policy, records, 1)
+        self.assertEqual(report["pairs_evaluated"], 1)
+        pair = report["pairs"][0]
+        self.assertEqual(len(pair["per_hop"]), 3)
+        self.assertEqual([entry["hop"] for entry in pair["per_hop"]], [1, 2, 3])
+        self.assertEqual(len(pair["greedy_prefix"]), 2)
+        self.assertIn("input_embeddings", pair["representations"])
+        self.assertIn("BiGRU", pair["representations"])
+        self.assertIn("SLP", pair["per_hop"][1])
+        self.assertEqual(len(report["by_hop"]), 3)
+
+    def test_gradient_diagnostic_does_not_update_model_weights(self):
+        policy = self.make_policy(max_hops=3)
+        policy._initialize_optimizer()
+        before = [np.array(variable.numpy(), copy=True)
+                  for variable in policy.trainable_variables]
+        before_step = int(policy.optimizer.iterations.numpy())
+        record = (["who", "is", "mother"], "A", {"C"}, 3, "q")
+
+        prediction, loss, path, statistics = policy.train_query(
+            record, update=False, report_gradients=True)
+        self.assertIn(prediction, {"A", "B", "C"})
+        self.assertIsInstance(path, list)
+        self.assertIsNotNone(loss)
+        self.assertIn("BiGRU", statistics["groups"])
+        self.assertIn("SLP", statistics["groups"])
+        self.assertIn("Perceptron", statistics["groups"])
+        self.assertIn("STOP", statistics["groups"])
+        self.assertGreaterEqual(statistics["rollout_steps"], 1)
+        self.assertEqual(int(policy.optimizer.iterations.numpy()), before_step)
+        for variable, old in zip(policy.trainable_variables, before):
+            np.testing.assert_array_equal(variable.numpy(), old)
+
     def test_mixed_hop_cli_does_not_require_oracle(self):
         from theseus_experiment import argument_parser
 

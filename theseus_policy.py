@@ -117,7 +117,8 @@ class TheseusSRN(tf.keras.Model):
             indices = tf.math.top_k(logits, k=count).indices.numpy().tolist()
         return [actions[index] for index in indices], tf.gather(logits, indices)
 
-    def train_query(self, record):
+    def train_query(self, record, update=True, report_gradients=False):
+        """Sample an answer-reward episode. Optional diagnostics never update weights."""
         self._initialize_optimizer()
         words, start, answers, _, _ = record
         # Gold hop annotations must never determine the number of rollout steps.
@@ -152,7 +153,11 @@ class TheseusSRN(tf.keras.Model):
                     break
             prediction = self.env.current_state.e_t
             if not log_probs:
-                return prediction, None, []
+                outcome = (prediction, None, [])
+                if report_gradients:
+                    return outcome + ({"groups": {}, "rollout_steps": 0,
+                                       "terminal_correct": float(prediction in answers)},)
+                return outcome
             # SRN paper, Sec. 2.4: all decisions in a completed successful
             # trajectory receive base R=1, even when earlier nodes are not
             # answers. Intermediate hits in unsuccessful episodes receive R=0.
@@ -172,10 +177,42 @@ class TheseusSRN(tf.keras.Model):
             # action log probabilities receive policy-gradient derivatives.
             loss = -tf.reduce_sum(tf.stack(log_probs) * tf.stop_gradient(tf.stack(returns)))
         grads = tape.gradient(loss, self.trainable_variables)
+        groups = None
+        if report_gradients:
+            # These are gradients of the *same sampled REINFORCE loss* as
+            # training. No alternate objective or reference path is used.
+            gradient_by_id = {
+                id(variable): gradient
+                for gradient, variable in zip(grads, self.trainable_variables)
+            }
+            group_variables = {
+                "BiGRU": self.BiGRU.trainable_variables,
+                "SLP": self.SLP.trainable_variables,
+                "Attention": self.Attention.trainable_variables,
+                "Perceptron": self.Perceptron.trainable_variables,
+                "GRU": self.GRU.trainable_variables,
+                "STOP": [self.stop_relation],
+            }
+            groups = {}
+            for name, variables in group_variables.items():
+                available = [gradient_by_id.get(id(variable)) for variable in variables]
+                present = [g for g in available if g is not None]
+                norm = float(tf.linalg.global_norm(present).numpy()) if present else 0.0
+                groups[name] = {
+                    "l2": norm,
+                    "variables": len(variables),
+                    "with_gradient": len(present),
+                    "missing_gradient": len(variables) - len(present),
+                }
         pairs = [(grad, variable) for grad, variable in zip(grads, self.trainable_variables) if grad is not None]
-        if pairs:
+        if pairs and update:
             self.optimizer.apply_gradients(pairs)
-        return prediction, float(loss.numpy()), list(self.env.current_state.h_t)
+        result = (prediction, float(loss.numpy()), list(self.env.current_state.h_t))
+        if report_gradients:
+            return result + ({"groups": groups,
+                              "rollout_steps": len(log_probs),
+                              "terminal_correct": float(prediction in answers)},)
+        return result
 
     def _predict_query_details(self, record):
         """Beam search with absorbing STOP actions and no gold-hop oracle.

@@ -31,7 +31,9 @@ def argument_parser():
     parser.add_argument("--dev-every", type=int, default=1,
                         help="Evaluate on dev every N epochs and on the final epoch (default: 1)")
     parser.add_argument("--sensitivity-pairs", type=int, default=0,
-                        help="Compare first-hop action distributions for N question pairs sharing a source")
+                        help="Compare question representations and per-hop action distributions for N pairs sharing a source")
+    parser.add_argument("--gradient-samples", type=int, default=0,
+                        help="During diagnose, inspect REINFORCE gradient norms for N sampled training questions without updating weights")
     parser.add_argument("--max-actions", type=int, default=200)
     parser.add_argument("--max-hops", type=int, default=None,
                         help="Global rollout horizon T (default: maximum hop length in selected split). "
@@ -152,10 +154,11 @@ def save_predictions(path, predictions):
 
 
 def question_sensitivity(policy, records, count):
-    """Check whether distinct questions change the same source's first-hop policy.
+    """Compare questions on a shared, gold-blind greedy navigation prefix.
 
-    This is a gold-blind diagnostic, not a new training signal or evaluation
-    metric. It compares unpruned first-hop distributions on identical edges.
+    At each hop both questions use the SAME graph node and GRU history, so
+    policy differences can only arise from the question representation.
+    The prefix is chosen by the first question and never from gold paths.
     """
     import numpy as np
     import tensorflow as tf
@@ -175,38 +178,108 @@ def question_sensitivity(policy, records, count):
             if len(pairs) >= count:
                 break
 
+    def representation_comparison(first_vectors, second_vectors):
+        first_vector = np.mean(np.asarray(first_vectors), axis=0)
+        second_vector = np.mean(np.asarray(second_vectors), axis=0)
+        difference = first_vector - second_vector
+        first_norm = np.linalg.norm(first_vector)
+        second_norm = np.linalg.norm(second_vector)
+        cosine = (float(np.dot(first_vector, second_vector) /
+                        (first_norm * second_norm))
+                  if first_norm > 1e-12 and second_norm > 1e-12 else None)
+        return {"cosine_similarity": cosine,
+                "pooled_l2_distance": float(np.linalg.norm(difference))}
+
     results = []
     for first, second in pairs:
         source = first[1]
-        actions = [(data["relation"], target)
-                   for _, target, data in policy.graph.out_edges(source, data=True)]
-        actions.append((STOP_RELATION, source))
-        if len(actions) < 2:
-            continue
+        first_words = np.stack([policy.Embedder.embed_word(w) for w in first[0]])
+        second_words = np.stack([policy.Embedder.embed_word(w) for w in second[0]])
+        encoded = [
+            policy.encode(first[0], training=False),
+            policy.encode(second[0], training=False),
+        ]
+        encodings = {
+            "input_embeddings": representation_comparison(first_words, second_words),
+            "BiGRU": representation_comparison(encoded[0].numpy(), encoded[1].numpy()),
+        }
 
-        def distribution(record):
-            encoded = policy.encode(record[0], training=False)
-            question = policy.SLP(encoded, t=1)
-            logits = policy.action_scores(
-                question, tf.zeros(policy.Embedder.dim, tf.float32), actions
-            )
-            return tf.nn.softmax(logits).numpy()
+        node, history, states = source, tf.zeros(policy.Embedder.dim, tf.float32), None
+        per_hop, greedy_prefix = [], []
+        for hop in range(1, policy.max_hops + 1):
+            actions = [(data["relation"], target)
+                       for _, target, data in policy.graph.out_edges(node, data=True)]
+            actions.append((STOP_RELATION, node))
+            # Both questions must use the same outgoing actions at each hop.
+            hop_questions = [policy.SLP(value, t=hop) for value in encoded]
+            distributions = [
+                tf.nn.softmax(policy.action_scores(question, history, actions)).numpy()
+                for question in hop_questions
+            ]
+            probability_difference = np.abs(distributions[0] - distributions[1])
+            best = [int(np.argmax(distribution)) for distribution in distributions]
+            entropy = [
+                float(-np.sum(distribution * np.log(
+                    np.maximum(distribution, 1e-30))))
+                for distribution in distributions
+            ]
+            per_hop.append({
+                "hop": hop,
+                "node": node,
+                "candidate_edges": len(actions),
+                "total_variation": float(0.5 * probability_difference.sum()),
+                "max_probability_difference": float(probability_difference.max()),
+                "same_top_action": best[0] == best[1],
+                "top_actions": [list(actions[index]) for index in best],
+                "top_action_probabilities": [
+                    float(distributions[index][best[index]]) for index in (0, 1)],
+                "action_entropy": entropy,
+                "stop_probabilities": [
+                    float(distribution[-1]) for distribution in distributions],
+                "SLP": representation_comparison(
+                    hop_questions[0].numpy(), hop_questions[1].numpy()),
+            })
+            relation, target = actions[best[0]]
+            if relation == STOP_RELATION:
+                break
+            greedy_prefix.append([node, relation, target])
+            if hop < policy.max_hops:
+                history, states = policy.GRU(
+                    policy.relation_vector(relation), states=states, training=False)
+            node = target
 
-        first_prob = distribution(first)
-        second_prob = distribution(second)
-        difference = np.abs(first_prob - second_prob)
-        first_best = int(np.argmax(first_prob))
-        second_best = int(np.argmax(second_prob))
+        first_hop = per_hop[0]
         results.append({
             "source": source,
             "question_ids": [first[4], second[4]],
-            "candidate_edges": len(actions),
-            "total_variation": float(0.5 * difference.sum()),
-            "max_probability_difference": float(difference.max()),
-            "same_top_action": first_best == second_best,
-            "top_actions": [list(actions[first_best]), list(actions[second_best])],
-            "stop_probabilities": [float(first_prob[-1]), float(second_prob[-1])],
+            "question_tokens": [first[0], second[0]],
+            "candidate_edges": first_hop["candidate_edges"],
+            "total_variation": first_hop["total_variation"],
+            "max_probability_difference": first_hop["max_probability_difference"],
+            "same_top_action": first_hop["same_top_action"],
+            "top_actions": first_hop["top_actions"],
+            "stop_probabilities": first_hop["stop_probabilities"],
+            "representations": encodings,
+            "greedy_prefix": greedy_prefix,
+            "per_hop": per_hop,
         })
+
+    by_hop = []
+    for hop in range(1, policy.max_hops + 1):
+        rows = [row["per_hop"][hop - 1] for row in results
+                if len(row["per_hop"]) >= hop]
+        if rows:
+            by_hop.append({
+                "hop": hop,
+                "pairs": len(rows),
+                "mean_total_variation": float(np.mean(
+                    [row["total_variation"] for row in rows])),
+                "same_top_action_rate": float(np.mean(
+                    [row["same_top_action"] for row in rows])),
+                "mean_stop_probability": [
+                    float(np.mean([row["stop_probabilities"][i] for row in rows]))
+                    for i in (0, 1)],
+            })
     return {
         "requested_pairs": count,
         "pairs_evaluated": len(results),
@@ -216,8 +289,10 @@ def question_sensitivity(policy, records, count):
         "same_top_action_rate": float(np.mean(
             [row["same_top_action"] for row in results]
         )) if results else None,
-        "warning": "Diagnostic only. No gold answers or paths are used. "
-                   "An unchanged top action does not imply identical probabilities.",
+        "by_hop": by_hop,
+        "warning": "Gold-blind question comparison. All paired distributions "
+                   "share the same source, candidate edges, and greedy prefix. "
+                   "The prefix follows the first question, not reference paths.",
         "pairs": results,
     }
 
@@ -227,24 +302,73 @@ def write_question_sensitivity(policy, records, count, output):
     path = output / "question_sensitivity.json"
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                     encoding="utf-8")
-    print("Question sensitivity: {} pairs, mean total variation {}, "
-          "same top action rate {}. Details: {}".format(
+    print("Question sensitivity: {} pairs, mean first-hop total variation {}, "
+          "same top action rate {}. Per-hop details: {}".format(
               report["pairs_evaluated"], report["mean_total_variation"],
               report["same_top_action_rate"], path), flush=True)
+
+
+def write_gradient_diagnostics(policy, records, count, output, seed,
+                               progress_seconds=15.0, progress_style="auto"):
+    """Measure actual sampled REINFORCE gradients without optimizer updates."""
+    import numpy as np
+
+    selected = random.Random(seed).sample(records, min(count, len(records)))
+    samples = []
+    with ProgressReporter("REINFORCE gradient diagnostic", len(selected),
+                          progress_seconds, progress_style) as progress:
+        for number, record in enumerate(selected, 1):
+            prediction, loss, path, statistics = policy.train_query(
+                record, update=False, report_gradients=True)
+            samples.append({
+                "id": record[4],
+                "correct": bool(prediction in record[2]),
+                "loss": loss,
+                "path_edge_count": len(path),
+                **statistics,
+            })
+            progress.update(number)
+
+    names = ("BiGRU", "SLP", "Attention", "Perceptron", "GRU", "STOP")
+    summary = {}
+    for name in names:
+        values = [sample["groups"][name]["l2"] for sample in samples
+                  if name in sample["groups"]]
+        summary[name] = {
+            "mean_gradient_l2": float(np.mean(values)) if values else None,
+            "nonzero_fraction": float(np.mean([value > 1e-12 for value in values]))
+            if values else None,
+        }
+    report = {
+        "scope": "Sampled on-policy SRN REINFORCE loss on training QA, without optimizer updates",
+        "requested_samples": count,
+        "samples_evaluated": len(samples),
+        "mean_terminal_success": float(np.mean([sample["correct"] for sample in samples]))
+        if samples else None,
+        "groups": summary,
+        "samples": samples,
+    }
+    path = output / "gradient_diagnostics.json"
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+    print("Gradient diagnostics: {} training queries. Details: {}".format(
+        len(samples), path), flush=True)
 
 
 def main():
     args = argument_parser().parse_args()
     if args.progress_seconds < 0:
         raise SystemExit("--progress-seconds must be non-negative")
-    if args.dev_every < 1 or args.sensitivity_pairs < 0 or args.beam_size < 1:
-        raise SystemExit("--dev-every and --beam-size must be positive; --sensitivity-pairs must be non-negative")
+    if args.dev_every < 1 or args.sensitivity_pairs < 0 or args.gradient_samples < 0 or args.beam_size < 1:
+        raise SystemExit("--dev-every and --beam-size must be positive; diagnostic counts must be non-negative")
     if args.max_actions < 2:
         raise SystemExit("--max-actions must be at least 2 to retain STOP alongside KG edges")
     if args.max_hops is not None and args.max_hops < 1:
         raise SystemExit("--max-hops must be positive")
-    if args.mode == "diagnose" and args.sensitivity_pairs == 0:
-        raise SystemExit("--mode diagnose requires --sensitivity-pairs N (N > 0)")
+    if args.mode == "diagnose" and args.sensitivity_pairs == 0 and args.gradient_samples == 0:
+        raise SystemExit("--mode diagnose requires --sensitivity-pairs N or --gradient-samples N")
+    if args.gradient_samples and args.mode != "diagnose":
+        raise SystemExit("--gradient-samples is only supported with --mode diagnose")
     if args.oracle_hops:
         print("Warning: --oracle-hops is deprecated and ignored. "
               "Rollouts use fixed T with learned STOP.", flush=True)
@@ -306,7 +430,12 @@ def main():
         checkpoint.restore(manager.latest_checkpoint).expect_partial()
 
     if args.mode == "diagnose":
-        write_question_sensitivity(policy, splits["dev"], args.sensitivity_pairs, output)
+        if args.sensitivity_pairs:
+            write_question_sensitivity(policy, splits["dev"], args.sensitivity_pairs, output)
+        if args.gradient_samples:
+            write_gradient_diagnostics(
+                policy, splits["train"], args.gradient_samples, output, args.seed,
+                args.progress_seconds, args.progress_style)
         return
 
     if args.mode == "train":

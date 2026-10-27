@@ -57,6 +57,14 @@ An additional entry point, `theseus_experiment.py`, supports the official
 from [Theseus in the Graph](https://arxiv.org/abs/2609.14528). Run the following
 commands from the repository root with Python 3.10+.
 
+**Reproducibility scope:** This repository is a third-party implementation,
+not an author-released SRN implementation. Its archived code does not fully
+specify or implement every component described in the SRN paper. The THESEUS
+adapter reconstructs missing behavior where feasible and records its choices,
+but functioning code alone does not establish reproduction of the published
+results. Treat model accuracy as adapted SRN results unless independently
+validated against the original benchmark and training configuration.
+
 # CPU-only installation. For NVIDIA GPUs, see the separate instructions below.
 ```bash
 python -m pip install -r requirements_theseus.txt
@@ -405,31 +413,49 @@ Skipped evaluations have blank `dev_hits1` and zero `dev_seconds` in
 dev/test evaluation still runs after training. Development and test use the
 existing `--beam-size` setting (default 32).
 
-### Question-conditioning diagnostic
+### Question-conditioning and REINFORCE gradient diagnostics
 
-To investigate whether distinct questions sharing a topic entity produce
-different relation preferences, SRN offers a **gold-blind** first-hop test.
-It compares softmax distributions on exactly the same outgoing KG actions
-**including STOP**, recording total variation, the maximum probability
-difference, the STOP probabilities, and whether the top-ranked action changes.
-No answer labels are inspected.
+To investigate why different questions from the same topic entity can produce
+identical trajectories, `--mode diagnose` supports two complementary reports.
 
-After training, with the saved model directory containing both the checkpoint
-and relation NPZ:
+1. **Question sensitivity** (`--sensitivity-pairs N`) compares pooled input
+   GloVe vectors, BiGRU representations, and hop-specific SLP representations.
+   It also compares full action distributions, entropy, top actions, and STOP
+   probabilities **at every hop**. For a fair comparison, both questions are
+   evaluated on the same graph node and GRU history. This shared prefix is
+   selected greedily from the first question, **never from annotated paths**.
+   Only the question varies between the two predictions. The original
+   first-hop summary fields remain available.
+2. **REINFORCE gradients** (`--gradient-samples N`) computes the actual
+   sampled training loss on randomly selected *training-split* questions.
+   It records gradient L2 norms for BiGRU, SLP, attention, perceptron, history
+   GRU, and STOP. It does **not** apply optimizer updates or alter checkpoint
+   weights. This diagnostic uses training answers for reward computation but
+   never uses reference paths.
+
+For example, after mixed-hop Kinship training:
 
 ```bash
-python theseus_experiment.py --dataset kinship --hops 3 --mode diagnose \
+python theseus_experiment.py --dataset kinship --hops n --max-hops 3 \
+  --mode diagnose --sensitivity-pairs 10 --gradient-samples 16 \
   --glove datasets/embeddings/glove.6B.50d.txt \
-  --output saved_models/theseus_kinship_single_3 \
-  --sensitivity-pairs 10
+  --relation-embeddings saved_models/kinship_transe/relations.npz \
+  --output saved_models/kinship_srn2 --seed 42
 ```
 
-This writes `question_sensitivity.json` and does not run the slow full
-beam-search evaluation. If several different questions from one source yield
-nearly identical action distributions, inspect question conditioning before
-attributing poor performance to the KG or the TransE embeddings. The optional
-`--sensitivity-pairs 10` argument can also be supplied to normal train or
-evaluate commands to save the diagnostic after evaluation.
+Results are written to `question_sensitivity.json` and
+`gradient_diagnostics.json` in the selected output directory. The former
+uses the dev split to compare questions, and the latter uses the train split
+to inspect training gradients. The command restores an existing checkpoint
+and skips expensive beam-search evaluation.
+
+Small action-distribution differences do not by themselves identify a coding
+bug. If input word vectors differ while BiGRU or SLP representations become
+indistinguishable, investigate the encoder. If these representations differ
+but action probabilities remain unchanged, inspect attention, perceptron
+saturation, and relation-score scaling. Nearly zero sampled REINFORCE
+gradients can also occur in zero-reward episodes, so inspect multiple samples
+and their terminal rewards before drawing conclusions.
 
 ### Live training and evaluation progress
 
