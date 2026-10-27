@@ -58,6 +58,7 @@ from [Theseus in the Graph](https://arxiv.org/abs/2609.14528). Run the following
 commands from the repository root with Python 3.10+.
 
 ```bash
+# CPU-only installation. For NVIDIA GPUs, see the separate instructions below.
 python -m pip install -r requirements_theseus.txt
 
 # Download Kinship's original navigation KG and official two-hop QA split.
@@ -77,6 +78,58 @@ python theseus_experiment.py --dataset kinship --hops 2 --mode train \
 python theseus_experiment.py --dataset kinship --hops 2 --mode evaluate \
   --glove datasets/embeddings/glove.6B.50d.txt
 ```
+
+### NVIDIA GPU setup (Linux)
+
+The default `requirements_theseus.txt` installs CPU-only TensorFlow.
+For NVIDIA GPUs, use the separate `requirements_theseus_gpu.txt` and do not
+install both requirements files in the same environment. Python 3.11 is
+recommended for the GPU setup below.
+
+```bash
+conda create -n SRN-GPU python=3.11 -y
+conda activate SRN-GPU
+python -m pip install --upgrade pip
+python -m pip install -r requirements_theseus_gpu.txt
+```
+
+To verify CUDA installation, run:
+
+```bash
+python -c "import tensorflow as tf; print('CUDA build:', tf.test.is_built_with_cuda()); print('GPUs:', tf.config.list_physical_devices('GPU'))"
+```
+
+**RTX 50-series / TensorFlow 2.21.0:** TensorFlow 2.21.0 has a confirmed
+[cuSOLVER search-path issue](https://github.com/tensorflow/tensorflow/issues/113541).
+Even with CUDA libraries installed, `GPUs: []` may appear. The following
+workaround is scoped to the active shell and does not modify system CUDA:
+
+```bash
+export LD_LIBRARY_PATH="$(python -c 'import os, site; p=os.path.join(site.getsitepackages()[0], "nvidia", "cusolver", "lib"); old=os.environ.get("LD_LIBRARY_PATH", ""); print(":".join([p]+[x for x in old.split(":") if x]))')"
+```
+
+NVIDIA Blackwell GPUs (including RTX 5070, compute capability 12.0a) also
+require a sufficiently recent CUDA PTX compiler. If training logs report
+`Used ptxas at /usr/bin/ptxas` with CUDA 12.0, prioritize the
+CUDA 12.9 compiler included in the environment:
+
+```bash
+export PATH="$(python -c 'import site, pathlib; print(pathlib.Path(site.getsitepackages()[0]) / "nvidia/cuda_nvcc/bin")'):$PATH"
+which ptxas
+ptxas --version
+```
+
+Verify a real GPU operation and XLA compilation before starting a long run:
+
+```bash
+python -c "import tensorflow as tf; f=tf.function(lambda x: tf.matmul(x,x), jit_compile=True); x=tf.ones([64,64]); print('Device:', f(x).device)"
+```
+
+The result should contain `GPU:0`. On RTX 50-series GPUs, TensorFlow
+may warn that kernels will be JIT-compiled from PTX. Successful execution on
+`GPU:0` is the important check. The two `export` commands apply only to
+the current terminal session. The system-installed NVIDIA driver and CUDA
+toolkit do not need to be replaced.
 
 ### Download GloVe from Zenodo
 
@@ -155,6 +208,31 @@ hop subsets (`--hops 2`, `3`, or `4`). Mixed `--hops n` is supported only with
 the explicit `--oracle-hops` acknowledgment because the original fixed-horizon
 SRN has no learned STOP action. Results using oracle horizons should **not**
 be compared directly with agents that infer their own stopping behavior.
+
+### Live training and evaluation progress
+
+Training prints the start of every epoch and a progress heartbeat every 15
+seconds by default, including examples completed, elapsed time and estimated
+remaining time. The heartbeat runs independently of per-question execution,
+so a long first GPU compilation step still produces status updates.
+Development and final test beam-search evaluations have their own progress
+indicators. Each epoch reports when checkpoint saving starts and ends.
+
+Set the reporting frequency without changing model training:
+
+```bash
+python theseus_experiment.py --dataset kinship --hops 3 --mode train \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --relation-embeddings saved_models/theseus_kinship_single_3/transe_relations.npz \
+  --progress-seconds 10
+```
+
+Set `--progress-seconds 0` to disable periodic heartbeats (stage
+start/end messages remain). ETA is approximate, especially during first-run
+CUDA PTX compilation. In addition to accuracy and loss, `metrics.csv` now
+records `train_seconds`, `dev_seconds` and `epoch_seconds`.
+Progress instrumentation does not change the loss, optimizer, rollout,
+reward or evaluation policy.
 
 ### Training and results
 

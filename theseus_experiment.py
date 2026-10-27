@@ -4,6 +4,8 @@ import argparse
 import csv
 import json
 import random
+import threading
+import time
 from pathlib import Path
 
 from theseus_data import load_release
@@ -27,7 +29,84 @@ def argument_parser():
     parser.add_argument("--checkpoint", default=None, help="Required for evaluation")
     parser.add_argument("--oracle-hops", action="store_true", help="Explicitly allow using annotated hop lengths for mixed n-hop data")
     parser.add_argument("--limit", type=int, default=None, help="Debug only: limit each split to N rows")
+    parser.add_argument("--progress-seconds", type=float, default=15.0,
+                        help="Progress heartbeat frequency in seconds (0 disables periodic heartbeat)")
     return parser
+
+
+def format_duration(seconds):
+    """Format a positive duration as hours:minutes:seconds."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+
+class ProgressReporter:
+    """Print a periodic heartbeat even while a single query is processing."""
+
+    def __init__(self, label, total, interval_seconds):
+        self.label = label
+        self.total = total
+        self.interval_seconds = interval_seconds
+        self.completed = 0
+        self.started = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        self.started = time.monotonic()
+        print("{}: 0/{} (0.0%) | elapsed 00:00:00 | ETA estimating".format(
+            self.label, self.total), flush=True)
+        if self.interval_seconds > 0:
+            self._thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self._thread.start()
+        return self
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval_seconds):
+            self.report()
+
+    def report(self):
+        with self._lock:
+            elapsed = time.monotonic() - self.started
+            percent = 100.0 * self.completed / self.total if self.total else 100.0
+            eta = (format_duration(elapsed / self.completed * (self.total - self.completed))
+                   if self.completed else "estimating")
+            print("{}: {}/{} ({:.1f}%) | elapsed {} | ETA {}".format(
+                self.label, self.completed, self.total, percent,
+                format_duration(elapsed), eta), flush=True)
+
+    def update(self, count):
+        with self._lock:
+            self.completed = count
+        if count == 1 or count == self.total:
+            self.report()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if exc_type is not None:
+            print("{} interrupted at {}/{}".format(
+                self.label, self.completed, self.total), flush=True)
+
+
+class ProgressRecords:
+    """Wrap evaluation records without changing the policy's evaluation path."""
+
+    def __init__(self, records, reporter):
+        self.records = records
+        self.reporter = reporter
+
+    def __len__(self):
+        return len(self.records)
+
+    def __iter__(self):
+        for count, record in enumerate(self.records, 1):
+            yield record
+            self.reporter.update(count)
 
 
 def save_predictions(path, predictions):
@@ -38,6 +117,8 @@ def save_predictions(path, predictions):
 
 def main():
     args = argument_parser().parse_args()
+    if args.progress_seconds < 0:
+        raise SystemExit("--progress-seconds must be non-negative")
     if args.hops == "n" and args.mode != "download" and not args.oracle_hops:
         raise SystemExit("Mixed-hop SRN requires annotated horizons. Pass --oracle-hops to acknowledge this non-comparable setting, or use --hops 2/3/4")
     graph, splits, graph_path = load_release(args.dataset, args.hops, args.answer_mode, args.data_root)
@@ -84,36 +165,64 @@ def main():
 
     if args.mode == "train":
         metrics_file = output / "metrics.csv"
+        fields = ("epoch", "train_hits1", "train_loss", "dev_hits1",
+                  "train_seconds", "dev_seconds", "epoch_seconds")
         with metrics_file.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=("epoch", "train_hits1", "train_loss", "dev_hits1"))
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for epoch in range(args.epochs):
+                epoch_started = time.monotonic()
                 train_records = splits["train"].copy()
                 random.shuffle(train_records)
                 hits, losses = 0, []
-                for number, record in enumerate(train_records, 1):
-                    prediction, loss, _ = policy.train_query(record)
-                    hits += int(prediction in record[2])
-                    if loss is not None:
-                        losses.append(loss)
-                    if number % 1000 == 0:
-                        print("Epoch {} trained {}/{}".format(epoch + 1, number, len(train_records)), flush=True)
-                dev_hits1, dev_predictions = policy.evaluate(splits["dev"])
+                with ProgressReporter(
+                    "Epoch {}/{} training".format(epoch + 1, args.epochs),
+                    len(train_records), args.progress_seconds
+                ) as progress:
+                    for number, record in enumerate(train_records, 1):
+                        prediction, loss, _ = policy.train_query(record)
+                        hits += int(prediction in record[2])
+                        if loss is not None:
+                            losses.append(loss)
+                        progress.update(number)
+                train_seconds = time.monotonic() - epoch_started
+
+                dev_started = time.monotonic()
+                with ProgressReporter(
+                    "Epoch {}/{} dev".format(epoch + 1, args.epochs),
+                    len(splits["dev"]), args.progress_seconds
+                ) as progress:
+                    dev_hits1, dev_predictions = policy.evaluate(
+                        ProgressRecords(splits["dev"], progress))
+                dev_seconds = time.monotonic() - dev_started
+
                 metrics = {"epoch": epoch + 1,
                            "train_hits1": hits / len(train_records) if train_records else 0,
                            "train_loss": float(np.mean(losses)) if losses else 0,
-                           "dev_hits1": dev_hits1}
+                           "dev_hits1": dev_hits1,
+                           "train_seconds": round(train_seconds, 3),
+                           "dev_seconds": round(dev_seconds, 3),
+                           "epoch_seconds": round(time.monotonic() - epoch_started, 3)}
                 writer.writerow(metrics)
                 handle.flush()
+                print("Epoch {}/{} saving checkpoint...".format(
+                    epoch + 1, args.epochs), flush=True)
                 manager.save(checkpoint_number=epoch + 1)
                 save_predictions(output / "dev_predictions.jsonl", dev_predictions)
-                print(metrics, flush=True)
+                print("Epoch {}/{} completed: {}".format(
+                    epoch + 1, args.epochs, metrics), flush=True)
 
     # Test is held out from epoch selection. Evaluation uses only model scores.
     for split in ("dev", "test"):
-        hits1, predictions = policy.evaluate(splits[split])
+        with ProgressReporter(
+            "Final {} evaluation".format(split), len(splits[split]),
+            args.progress_seconds
+        ) as progress:
+            hits1, predictions = policy.evaluate(
+                ProgressRecords(splits[split], progress))
         save_predictions(output / (split + "_predictions.jsonl"), predictions)
-        print("{} Hits@1 {:.4f} on {} examples".format(split, hits1, len(predictions)))
+        print("{} Hits@1 {:.4f} on {} examples".format(
+            split, hits1, len(predictions)), flush=True)
     print("Missing GloVe tokens: {}".format(len(embedder.missing_words)))
 
 
