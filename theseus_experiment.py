@@ -20,7 +20,7 @@ def argument_parser():
     parser.add_argument("--dataset", choices=("kinship", "mquake-st"), required=True)
     parser.add_argument("--hops", choices=("2", "3", "4", "n"), default="n")
     parser.add_argument("--answer-mode", choices=("single", "multi"), default="single")
-    parser.add_argument("--mode", choices=("download", "train", "evaluate"), default="train")
+    parser.add_argument("--mode", choices=("download", "train", "evaluate", "diagnose"), default="train")
     parser.add_argument("--data-root", default="datasets/theseus")
     parser.add_argument("--glove", default="datasets/embeddings/glove.6B.50d.txt")
     parser.add_argument("--relation-embeddings", default=None)
@@ -28,6 +28,10 @@ def argument_parser():
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--beam-size", type=int, default=32)
+    parser.add_argument("--dev-every", type=int, default=1,
+                        help="Evaluate on dev every N epochs and on the final epoch (default: 1)")
+    parser.add_argument("--sensitivity-pairs", type=int, default=0,
+                        help="Compare first-hop action distributions for N question pairs sharing a source")
     parser.add_argument("--max-actions", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default=None, help="Required for evaluation")
@@ -143,10 +147,93 @@ def save_predictions(path, predictions):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def question_sensitivity(policy, records, count):
+    """Check whether distinct questions change the same source's first-hop policy.
+
+    This is a gold-blind diagnostic, not a new training signal or evaluation
+    metric. It compares unpruned first-hop distributions on identical edges.
+    """
+    import numpy as np
+    import tensorflow as tf
+
+    first_by_source, used_sources, pairs = {}, set(), []
+    for record in records:
+        source = record[1]
+        if source in used_sources:
+            continue
+        prior = first_by_source.get(source)
+        if prior is None:
+            first_by_source[source] = record
+        elif prior[0] != record[0]:
+            pairs.append((prior, record))
+            used_sources.add(source)
+            if len(pairs) >= count:
+                break
+
+    results = []
+    for first, second in pairs:
+        source = first[1]
+        actions = [(data["relation"], target)
+                   for _, target, data in policy.graph.out_edges(source, data=True)]
+        if len(actions) < 2:
+            continue
+
+        def distribution(record):
+            encoded = policy.encode(record[0], training=False)
+            question = policy.SLP(encoded, t=1)
+            logits = policy.action_scores(
+                question, tf.zeros(policy.Embedder.dim, tf.float32), actions
+            )
+            return tf.nn.softmax(logits).numpy()
+
+        first_prob = distribution(first)
+        second_prob = distribution(second)
+        difference = np.abs(first_prob - second_prob)
+        first_best = int(np.argmax(first_prob))
+        second_best = int(np.argmax(second_prob))
+        results.append({
+            "source": source,
+            "question_ids": [first[4], second[4]],
+            "candidate_edges": len(actions),
+            "total_variation": float(0.5 * difference.sum()),
+            "max_probability_difference": float(difference.max()),
+            "same_top_action": first_best == second_best,
+            "top_actions": [list(actions[first_best]), list(actions[second_best])],
+        })
+    return {
+        "requested_pairs": count,
+        "pairs_evaluated": len(results),
+        "mean_total_variation": float(np.mean(
+            [row["total_variation"] for row in results]
+        )) if results else None,
+        "same_top_action_rate": float(np.mean(
+            [row["same_top_action"] for row in results]
+        )) if results else None,
+        "warning": "Diagnostic only. No gold answers or paths are used. "
+                   "An unchanged top action does not imply identical probabilities.",
+        "pairs": results,
+    }
+
+
+def write_question_sensitivity(policy, records, count, output):
+    report = question_sensitivity(policy, records, count)
+    path = output / "question_sensitivity.json"
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+    print("Question sensitivity: {} pairs, mean total variation {}, "
+          "same top action rate {}. Details: {}".format(
+              report["pairs_evaluated"], report["mean_total_variation"],
+              report["same_top_action_rate"], path), flush=True)
+
+
 def main():
     args = argument_parser().parse_args()
     if args.progress_seconds < 0:
         raise SystemExit("--progress-seconds must be non-negative")
+    if args.dev_every < 1 or args.sensitivity_pairs < 0 or args.beam_size < 1:
+        raise SystemExit("--dev-every and --beam-size must be positive; --sensitivity-pairs must be non-negative")
+    if args.mode == "diagnose" and args.sensitivity_pairs == 0:
+        raise SystemExit("--mode diagnose requires --sensitivity-pairs N (N > 0)")
     if args.hops == "n" and args.mode != "download" and not args.oracle_hops:
         raise SystemExit("Mixed-hop SRN requires annotated horizons. Pass --oracle-hops to acknowledge this non-comparable setting, or use --hops 2/3/4")
     graph, splits, graph_path = load_release(args.dataset, args.hops, args.answer_mode, args.data_root)
@@ -192,10 +279,14 @@ def main():
     manager = tf.train.CheckpointManager(checkpoint, str(output / "checkpoints"), max_to_keep=3)
     if args.checkpoint:
         checkpoint.restore(args.checkpoint).expect_partial()
-    elif args.mode == "evaluate":
+    elif args.mode in ("evaluate", "diagnose"):
         if not manager.latest_checkpoint:
             raise SystemExit("No checkpoint found. Use --checkpoint or train first")
         checkpoint.restore(manager.latest_checkpoint).expect_partial()
+
+    if args.mode == "diagnose":
+        write_question_sensitivity(policy, splits["dev"], args.sensitivity_pairs, output)
+        return
 
     if args.mode == "train":
         metrics_file = output / "metrics.csv"
@@ -224,14 +315,20 @@ def main():
                             hits1="{:.4f}".format(hits / number))
                 train_seconds = time.monotonic() - epoch_started
 
-                dev_started = time.monotonic()
-                with ProgressReporter(
-                    "Epoch {}/{} dev".format(epoch + 1, args.epochs),
-                    len(splits["dev"]), args.progress_seconds, args.progress_style
-                ) as progress:
-                    dev_hits1, dev_predictions = policy.evaluate(
-                        ProgressRecords(splits["dev"], progress))
-                dev_seconds = time.monotonic() - dev_started
+                run_dev = (epoch + 1) % args.dev_every == 0 or epoch + 1 == args.epochs
+                dev_hits1, dev_predictions, dev_seconds = "", None, 0.0
+                if run_dev:
+                    dev_started = time.monotonic()
+                    with ProgressReporter(
+                        "Epoch {}/{} dev".format(epoch + 1, args.epochs),
+                        len(splits["dev"]), args.progress_seconds, args.progress_style
+                    ) as progress:
+                        dev_hits1, dev_predictions = policy.evaluate(
+                            ProgressRecords(splits["dev"], progress))
+                    dev_seconds = time.monotonic() - dev_started
+                else:
+                    print("Epoch {}/{}: skipping dev (--dev-every {})".format(
+                        epoch + 1, args.epochs, args.dev_every), flush=True)
 
                 metrics = {"epoch": epoch + 1,
                            "train_hits1": hits / len(train_records) if train_records else 0,
@@ -245,7 +342,8 @@ def main():
                 print("Epoch {}/{} saving checkpoint...".format(
                     epoch + 1, args.epochs), flush=True)
                 manager.save(checkpoint_number=epoch + 1)
-                save_predictions(output / "dev_predictions.jsonl", dev_predictions)
+                if dev_predictions is not None:
+                    save_predictions(output / "dev_predictions.jsonl", dev_predictions)
                 print("Epoch {}/{} completed: {}".format(
                     epoch + 1, args.epochs, metrics), flush=True)
 
@@ -260,6 +358,8 @@ def main():
         save_predictions(output / (split + "_predictions.jsonl"), predictions)
         print("{} Hits@1 {:.4f} on {} examples".format(
             split, hits1, len(predictions)), flush=True)
+    if args.sensitivity_pairs:
+        write_question_sensitivity(policy, splits["dev"], args.sensitivity_pairs, output)
     print("GloVe OOV tokens encountered during rollout (excluding <e>): {}".format(
         len(embedder.missing_words - {"<e>"})))
 

@@ -312,6 +312,72 @@ the explicit `--oracle-hops` acknowledgment because the original fixed-horizon
 SRN has no learned STOP action. Results using oracle horizons should **not**
 be compared directly with agents that infer their own stopping behavior.
 
+### Published SRN reward and beam-search efficiency
+
+The THESEUS adapter now matches the published SRN base reward in Section 2.4:
+**only final-answer correctness** determines the episode's base reward.
+When the complete trajectory reaches an answer, every decision receives the
+positive base reward before potential-based shaping. An intermediate visit to
+an answer followed by a wrong endpoint receives no positive **base** reward.
+The potential shaping term remains
+`gamma * phi(next_state) - phi(current_state)`, and the policy continues to use
+on-policy REINFORCE without reference-path supervision.
+
+Previous THESEUS SRN checkpoints were trained with an intermediate-answer
+reward and should **not** be mixed into experiments using the corrected
+objective. Use a new `--output` directory and retrain from scratch when
+comparing results.
+
+Evaluation keeps the same learned relation scores and global beam ordering,
+but computes candidate relation scores in batches, advances GRU histories
+only for branches surviving beam pruning, and omits unnecessary history
+updates at the final step. This avoids a large number of tiny TensorFlow
+operations during development/test evaluation. The result is intended to
+preserve the exact inference decisions, aside from ordinary floating-point
+roundoff. Actual speedup will depend on GPU, KG branching and beam width.
+
+To reduce frequent expensive dev runs while retaining full evaluation on the
+final epoch, set `--dev-every N`, for example:
+
+```bash
+python theseus_experiment.py --dataset kinship --hops 3 --mode train \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --relation-embeddings saved_models/kinship_transe/relations.npz \
+  --output saved_models/kinship_srn_paper_reward \
+  --epochs 100 --dev-every 5 --seed 42
+```
+
+The default `--dev-every 1` preserves development evaluation every epoch.
+Skipped evaluations have blank `dev_hits1` and zero `dev_seconds` in
+`metrics.csv`. Checkpoints are still saved every epoch, and full final
+dev/test evaluation still runs after training. Development and test use the
+existing `--beam-size` setting (default 32).
+
+### Question-conditioning diagnostic
+
+To investigate whether distinct questions sharing a topic entity produce
+different relation preferences, SRN offers a **gold-blind** first-hop test.
+It compares softmax distributions on exactly the same outgoing KG actions,
+recording total variation, the maximum probability difference, and whether
+the top-ranked action changes. No answer labels are inspected.
+
+After training, with the saved model directory containing both the checkpoint
+and relation NPZ:
+
+```bash
+python theseus_experiment.py --dataset kinship --hops 3 --mode diagnose \
+  --glove datasets/embeddings/glove.6B.50d.txt \
+  --output saved_models/theseus_kinship_single_3 \
+  --sensitivity-pairs 10
+```
+
+This writes `question_sensitivity.json` and does not run the slow full
+beam-search evaluation. If several different questions from one source yield
+nearly identical action distributions, inspect question conditioning before
+attributing poor performance to the KG or the TransE embeddings. The optional
+`--sensitivity-pairs 10` argument can also be supplied to normal train or
+evaluate commands to save the diagnostic after evaluation.
+
 ### Live training and evaluation progress
 
 Interactive terminals display `tqdm` progress bars for every training epoch,
@@ -363,5 +429,5 @@ as references, but the legacy environment is not guaranteed to run unchanged.
 Run adapter tests using:
 
 ```bash
-python -m unittest -v test_theseus_data.py test_prepare_embeddings.py test_glove_coverage.py
+python -m unittest -v test_theseus_data.py test_prepare_embeddings.py test_glove_coverage.py test_srn_policy_updates.py
 ```

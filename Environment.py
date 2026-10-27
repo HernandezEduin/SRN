@@ -1,4 +1,4 @@
-"""Directed KG navigation and SRN's answer-only potential-based rewards."""
+"""Directed KG navigation and paper-aligned potential-based reward shaping."""
 
 import tensorflow as tf
 
@@ -36,11 +36,20 @@ class Rewards:
         history = tf.math.l2_normalize(histories[t], axis=0)
         return tf.maximum(tf.reduce_sum(question * history), 0.0)
 
+    @staticmethod
+    def terminal_base_reward(final_entity, answers):
+        """Published SRN base reward for every action of a completed episode."""
+        return float(final_entity in answers)
+
     def get_transition_reward(self, cur_state, action, next_state, answers):
-        # Reward shaping is detached from the policy-gradient objective below.
-        hit = float(next_state.e_t in answers)
+        """Return shaping only, since final-answer correctness is not yet known.
+
+        SRN assigns the same base reward to every decision after the complete
+        trajectory is observed. Awarding it on intermediate visits would reward
+        episodes that pass through an answer but finish at the wrong entity.
+        """
         shaped = self.gamma * self.phi(next_state) - self.phi(cur_state)
-        return tf.stop_gradient(tf.cast(hit, tf.float32) + shaped)
+        return tf.stop_gradient(shaped)
 
 
 class Environment:

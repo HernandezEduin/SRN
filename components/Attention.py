@@ -24,6 +24,14 @@ class Attention(layers.Layer):
 
         return q_t_star
 
+    def call_many(self, relation_vectors, q_t):
+        """Vectorized equivalent of call() for relations with one history."""
+        # [relations, words], including the same learned scalar bias.
+        weighted_relations = relation_vectors * self.W[None, :]
+        logits = tf.matmul(weighted_relations, q_t, transpose_b=True) + self.b
+        attention = tf.nn.softmax(logits, axis=1)
+        return tf.matmul(attention, q_t)
+
     def beta_stars(self, r_star, w_t_m):
         output = r_star * w_t_m
         b_star = self.W * output + self.b

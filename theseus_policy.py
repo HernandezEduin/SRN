@@ -35,20 +35,29 @@ class TheseusSRN(tf.keras.Model):
         return self.BiGRU(tf.convert_to_tensor(vectors[None, :, :], tf.float32), training=training)
 
     def action_scores(self, question_at_t, history, actions):
-        # SRN scores the relation of each KG action. Different neighbors with
-        # the same relation therefore receive the same relation-based score.
-        unique = {}
-        scores = []
+        """Score each KG edge using a batched computation over unique relations.
+
+        The original SRN score is relation-only. Duplicate relations receive
+        identical scores, and gradients still flow through attention and the
+        semantic perceptron exactly as in their scalar implementations.
+        """
+        relation_ids = {}
+        vectors = []
+        indices = []
         for relation, _ in actions:
-            if relation not in unique:
+            if relation not in relation_ids:
                 vector = self.Embedder.embed_relation(relation)
                 if vector is None:
                     raise ValueError("Missing frozen TransE vector for relation {}".format(relation))
-                relation_vector = tf.convert_to_tensor(vector, tf.float32)
-                attended = self.Attention(relation_vector, question_at_t)
-                unique[relation] = self.Perceptron(relation_vector, history, attended)
-            scores.append(unique[relation])
-        return tf.stack(scores)
+                relation_ids[relation] = len(vectors)
+                vectors.append(vector)
+            indices.append(relation_ids[relation])
+        if not vectors:
+            return tf.zeros((0,), tf.float32)
+        relation_vectors = tf.convert_to_tensor(np.stack(vectors), tf.float32)
+        attended = self.Attention.call_many(relation_vectors, question_at_t)
+        unique_scores = self.Perceptron.call_many(relation_vectors, history, attended)
+        return tf.gather(unique_scores, indices)
 
     def prune(self, actions, logits, count):
         if len(actions) <= count:
@@ -83,11 +92,20 @@ class TheseusSRN(tf.keras.Model):
                 )
                 history, gru_states = self.GRU(relation_vector, states=gru_states, training=True)
                 history_mem[t + 1] = history
-                _, reward = self.env.transit(selected, t, question_mem, history_mem)
-                rewards.append(reward)
+                _, shaping_reward = self.env.transit(selected, t, question_mem, history_mem)
+                rewards.append(shaping_reward)
             prediction = self.env.current_state.e_t
             if not log_probs:
                 return prediction, None, []
+            # SRN paper, Sec. 2.4: all decisions in a completed successful
+            # trajectory receive base R=1, even when earlier nodes are not
+            # answers. Intermediate hits in unsuccessful episodes receive R=0.
+            terminal_reward = tf.constant(
+                self.env.rewards_func.terminal_base_reward(prediction, answers),
+                tf.float32
+            )
+            rewards = [tf.stop_gradient(shaping + terminal_reward)
+                       for shaping in rewards]
             running = tf.constant(0.0, tf.float32)
             returns = []
             for reward in reversed(rewards):
@@ -104,11 +122,15 @@ class TheseusSRN(tf.keras.Model):
         return prediction, float(loss.numpy()), list(self.env.current_state.h_t)
 
     def predict_query(self, record):
-        """Answer-blind, relation-score-based beam search."""
+        """Answer-blind, relation-score-based beam search.
+
+        Histories are advanced only for surviving branches. Updating discarded
+        branches cannot affect the chosen beam and wastes many small GRU calls.
+        The final step needs no history update because no further scoring occurs.
+        """
         words, start, _, hops, _ = record
         encoded = self.encode(words, training=False)
         step_questions = {t: self.SLP(encoded, t=t) for t in range(1, hops + 1)}
-        # beam: node, log probability, history vector, GRU states, trajectory
         beams = [(start, 0.0, tf.zeros(d, tf.float32), None, [])]
         for t in range(1, hops + 1):
             candidates = []
@@ -116,7 +138,7 @@ class TheseusSRN(tf.keras.Model):
                 self.env.start_new_query(State(encoded, start, node), frozenset())
                 actions = self.env.get_possible_actions()
                 if not actions:
-                    candidates.append((node, path_score, history, states, path))
+                    candidates.append((node, path_score, history, states, path, None))
                     continue
                 logits = self.action_scores(step_questions[t], history, actions)
                 actions, logits = self.prune(actions, logits, self.max_actions)
@@ -124,17 +146,30 @@ class TheseusSRN(tf.keras.Model):
                 best_indices = np.argsort(-log_probabilities)[:self.beam_size]
                 for index in best_indices:
                     relation, target = actions[int(index)]
-                    relation_vector = tf.convert_to_tensor(
-                        self.Embedder.embed_relation(relation), tf.float32
-                    )
-                    next_history, next_states = self.GRU(relation_vector, states=states, training=False)
-                    candidates.append((target, path_score + float(log_probabilities[index]),
-                                       next_history, next_states, path + [(node, relation, target)]))
-            beams = sorted(candidates, key=lambda branch: branch[1], reverse=True)[:self.beam_size]
-            if not beams:
+                    candidates.append((
+                        target, path_score + float(log_probabilities[index]),
+                        history, states, path + [(node, relation, target)], relation
+                    ))
+            best = sorted(candidates, key=lambda branch: branch[1], reverse=True)[:self.beam_size]
+            if not best:
                 break
-        best = beams[0]
-        return best[0], best[4]
+            if t == hops:
+                return best[0][0], best[0][4]
+            beams = []
+            for target, score, history, states, path, relation in best:
+                if relation is None:
+                    beams.append((target, score, history, states, path))
+                    continue
+                relation_vector = tf.convert_to_tensor(
+                    self.Embedder.embed_relation(relation), tf.float32
+                )
+                next_history, next_states = self.GRU(
+                    relation_vector, states=states, training=False
+                )
+                beams.append((target, score, next_history, next_states, path))
+        if not beams:
+            return start, []
+        return beams[0][0], beams[0][4]
 
     def evaluate(self, examples):
         predictions, correct = [], 0

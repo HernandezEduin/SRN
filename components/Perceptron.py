@@ -26,3 +26,12 @@ class Perceptron(layers.Layer):
 
         return semantic_score
 
+    def call_many(self, relation_vectors, history, attended_questions):
+        """Vectorized equivalent of call() with one shared history."""
+        histories = tf.broadcast_to(history[None, :], tf.shape(relation_vectors))
+        features = tf.concat([histories, attended_questions], axis=1)
+        hidden = tf.nn.relu(tf.matmul(features, self.W_L1, transpose_b=True))
+        return tf.reduce_sum(
+            relation_vectors * hidden * self.W_L2[None, :], axis=1
+        )
+
